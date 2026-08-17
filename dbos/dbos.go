@@ -688,6 +688,8 @@ func NewContext(ctx context.Context, inputConfig Config) (Context, error) {
 	if conductorCfg != nil {
 		conductor, err := newConductor(initExecutor, *conductorCfg)
 		if err != nil {
+			initExecutor.ctxCancelFunc(err)
+			initExecutor.systemDB.Shutdown(initExecutor, _LAUNCH_ROLLBACK_TIMEOUT)
 			return nil, models.NewInitializationError(fmt.Sprintf("failed to initialize conductor: %v", err))
 		}
 		initExecutor.conductor = conductor

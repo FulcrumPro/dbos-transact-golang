@@ -2442,6 +2442,7 @@ func TestClientCustomSqliteDB(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "dbos.db")
 	serverDB, err := sql.Open("sqlite", dbPath)
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, serverDB.Close()) })
 	serverCtx, err := NewContext(context.Background(), Config{
 		AppName:        "test-client-custom-sqlite-db",
 		SQLiteSystemDB: serverDB,
@@ -2462,6 +2463,7 @@ func TestClientCustomSqliteDB(t *testing.T) {
 
 	clientDB, err := sql.Open("sqlite", dbPath)
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, clientDB.Close()) })
 
 	c, err := NewClient(context.Background(), ClientConfig{SQLiteSystemDB: clientDB})
 	require.NoError(t, err)
@@ -2507,6 +2509,7 @@ func TestClientCustomPool(t *testing.T) {
 	require.NoError(t, err)
 	clientPool, err := pgxpool.NewWithConfig(context.Background(), clientPoolConfig)
 	require.NoError(t, err)
+	t.Cleanup(clientPool.Close)
 
 	c, err := NewClient(context.Background(), ClientConfig{SystemDBPool: clientPool})
 	require.NoError(t, err)

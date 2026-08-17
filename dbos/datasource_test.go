@@ -883,8 +883,9 @@ func TestRunAsTransaction(t *testing.T) {
 func setupSharedDBOS(t *testing.T) (Context, *DataSource, *userBackend) {
 	t.Helper()
 	var (
-		config Config
-		ub     *userBackend
+		config    Config
+		ub        *userBackend
+		closePool func()
 	)
 	if useSqliteBackend() {
 		// Open the shared handle with DBOS's recommended pragmas (busy_timeout,
@@ -895,6 +896,7 @@ func setupSharedDBOS(t *testing.T) (Context, *DataSource, *userBackend) {
 		require.NoError(t, err)
 		config = Config{AppName: "test-app", SQLiteSystemDB: db}
 		ub = &userBackend{pool: sysdb.NewSQLPool(db), dialect: sysdb.SqliteDialect{}, schema: _DEFAULT_SYSTEM_DB_SCHEMA}
+		closePool = func() { require.NoError(t, db.Close()) }
 	} else {
 		url := getDatabaseURL()
 		resetTestDatabase(t, url)
@@ -904,13 +906,15 @@ func setupSharedDBOS(t *testing.T) (Context, *DataSource, *userBackend) {
 		require.NoError(t, err)
 		config = Config{AppName: "test-app", SystemDBPool: pool}
 		ub = &userBackend{pool: sysdb.NewPgxPool(pool), dialect: sysdb.PostgresDialect{}, schema: _DEFAULT_SYSTEM_DB_SCHEMA}
+		closePool = pool.Close
 	}
 
 	ctx, err := NewContext(context.Background(), config)
 	require.NoError(t, err)
-	// Shutdown owns the shared pool (sysDB.shutdown closes it); don't close it
-	// separately here.
-	t.Cleanup(func() { Shutdown(ctx, 30*time.Second) })
+	t.Cleanup(func() {
+		Shutdown(ctx, 30*time.Second)
+		closePool()
+	})
 
 	// A leftover completion table from a prior two-table test (reset clears rows,
 	// not tables) would mask the optimization. Start clean.

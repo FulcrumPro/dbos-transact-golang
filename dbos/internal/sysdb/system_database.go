@@ -153,6 +153,7 @@ type ExportedWorkflow struct {
 
 type SysDB struct {
 	pool                 Pool
+	ownsPool             bool
 	dialect              Dialect
 	notificationLoopMu   sync.Mutex
 	notificationLoopDone chan struct{}
@@ -1071,6 +1072,7 @@ func NewSystemDatabase(ctx context.Context, inputs NewSystemDatabaseInput) (Syst
 
 	return &SysDB{
 		pool:                         NewPgxPool(pool),
+		ownsPool:                     customPool == nil,
 		dialect:                      dialect,
 		appName:                      inputs.AppName,
 		RecvNotifier:                 newNotifyRegistry(_DBOS_NOTIFICATIONS_CHANNEL, false),
@@ -1191,7 +1193,7 @@ func (s *SysDB) Shutdown(ctx context.Context, timeout time.Duration) []string {
 		}
 	}
 
-	if s.pool != nil {
+	if s.pool != nil && s.ownsPool {
 		poolClose := make(chan struct{})
 		go func() {
 			// Will block until every acquired connection is released
@@ -6460,6 +6462,9 @@ func DropDatabaseIfExists(ctx context.Context, conn *pgx.Conn, dbName string) er
 }
 
 func (s *SysDB) ResetSystemDB(ctx context.Context) error {
+	if !s.ownsPool {
+		return fmt.Errorf("cannot reset a system database backed by a caller-owned pool")
+	}
 	// Get the current database configuration from the pool
 	config := PgxPool(s.pool).Config()
 	if config == nil || config.ConnConfig == nil {

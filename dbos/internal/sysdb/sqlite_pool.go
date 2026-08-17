@@ -177,6 +177,7 @@ func newSqliteSystemDatabase(encodeScheduledInput func(context.Context, time.Tim
 	}
 	return &SysDB{
 		pool:                 NewSQLPool(db),
+		ownsPool:             owned,
 		dialect:              SqliteDialect{},
 		appName:              appName,
 		RecvNotifier:         newNotifyRegistry(_DBOS_NOTIFICATIONS_CHANNEL, false),

@@ -438,6 +438,23 @@ func TestConfig(t *testing.T) {
 
 }
 
+func TestNewContextConductorFailurePreservesCustomPool(t *testing.T) {
+	skipIfSqlite(t, "PostgreSQL custom pool ownership")
+
+	pool, err := pgxpool.New(context.Background(), getDatabaseURL())
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+
+	_, err = NewContext(context.Background(), Config{
+		AppName:         "test-conductor-construction-failure",
+		SystemDBPool:    pool,
+		ConductorAPIKey: "key",
+		ConductorURL:    "://invalid",
+	})
+	require.Error(t, err)
+	require.NoError(t, pool.Ping(context.Background()))
+}
+
 func TestSystemDBStartupTimeoutConfig(t *testing.T) {
 	t.Run("Default", func(t *testing.T) {
 		config, err := processConfig(&Config{AppName: "test", DatabaseURL: "sqlite::memory:"})
@@ -1113,6 +1130,7 @@ func TestCustomPool(t *testing.T) {
 
 		pool, err := pgxpool.NewWithConfig(context.Background(), poolConfig)
 		require.NoError(t, err)
+		defer pool.Close()
 
 		config := Config{
 			AppName:      "test-custom-pool",
@@ -1207,6 +1225,7 @@ func TestCustomPool(t *testing.T) {
 		require.NoError(t, err)
 		pool, err := pgxpool.NewWithConfig(context.Background(), poolConfig)
 		require.NoError(t, err)
+		defer pool.Close()
 
 		config := Config{
 			DatabaseURL:  invalidDatabaseURL,
@@ -1235,6 +1254,7 @@ func TestCustomPool(t *testing.T) {
 		poolConfig.ConnConfig.Host = "invalid-host"
 		pool, err := pgxpool.NewWithConfig(context.Background(), poolConfig)
 		require.NoError(t, err)
+		defer pool.Close()
 
 		config := Config{
 			DatabaseURL:  databaseURL,
@@ -1293,6 +1313,7 @@ func TestCustomPool(t *testing.T) {
 		shutdownTimeout := 2 * time.Second
 		systemDB.Shutdown(ctx, shutdownTimeout)
 		assert.False(t, systemDB.(*sysdb.SysDB).Launched())
+		require.NoError(t, customPool.Ping(context.Background()))
 	})
 }
 
@@ -1334,16 +1355,12 @@ func TestClientShutdownReportsSystemDBTimeout(t *testing.T) {
 	skipIfSqlite(t, "holds a pgx pool connection to block pool close")
 	ctx := context.Background()
 
-	poolConfig, err := pgxpool.ParseConfig(getDatabaseURL())
-	require.NoError(t, err)
-	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
-	require.NoError(t, err)
-
 	client, err := NewClient(ctx, ClientConfig{
-		SystemDBPool:   pool,
+		DatabaseURL:    getDatabaseURL(),
 		DatabaseSchema: "dbos_test_shutdown_client",
 	})
 	require.NoError(t, err)
+	pool := PgxPool(client.(*dbosContext).systemDB.(*sysdb.SysDB).Pool())
 
 	// A held connection blocks pool.Close() past the timeout
 	conn, err := pool.Acquire(ctx)
@@ -1904,6 +1921,7 @@ func TestCustomSqlitePool(t *testing.T) {
 		dbPath := filepath.Join(t.TempDir(), "dbos.db")
 		db, err := sql.Open("sqlite", dbPath)
 		require.NoError(t, err)
+		defer db.Close()
 		db.SetMaxOpenConns(8)
 		db.SetMaxIdleConns(4)
 		db.SetConnMaxLifetime(time.Hour)
@@ -1960,6 +1978,7 @@ func TestCustomSqlitePool(t *testing.T) {
 		dbPath := filepath.Join(t.TempDir(), "dbos.db")
 		db, err := sql.Open("sqlite", dbPath)
 		require.NoError(t, err)
+		defer db.Close()
 
 		config := Config{
 			DatabaseURL:    "postgres://invalid:invalid@localhost:5432/invaliddb",
@@ -2030,6 +2049,7 @@ func TestCustomSqlitePool(t *testing.T) {
 		cancel()
 		systemDB.Shutdown(ctx, 2*time.Second)
 		assert.False(t, systemDB.(*sysdb.SysDB).Launched())
+		require.NoError(t, customDB.PingContext(context.Background()))
 	})
 }
 
