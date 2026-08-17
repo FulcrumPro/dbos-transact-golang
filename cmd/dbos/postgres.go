@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -57,8 +58,37 @@ func runPostgresStop(cmd *cobra.Command, args []string) error {
 	return stopDockerPostgres()
 }
 
+var inspectDockerContext = func(ctx context.Context) ([]byte, error) {
+	return exec.CommandContext(
+		ctx,
+		"docker",
+		"context",
+		"inspect",
+		"--format",
+		`{{ (index .Endpoints "docker").Host }}`,
+	).Output()
+}
+
+func newDockerClient() (*client.Client, error) {
+	options := []client.Opt{client.FromEnv}
+	if os.Getenv(client.EnvOverrideHost) == "" {
+		output, err := inspectDockerContext(context.Background())
+		if err != nil {
+			return nil, fmt.Errorf("failed to inspect active Docker context: %w", err)
+		}
+
+		host := strings.TrimSpace(string(output))
+		if host == "" || host == "<no value>" {
+			return nil, fmt.Errorf("active Docker context has no Docker endpoint")
+		}
+		options = append(options, client.WithHost(host))
+	}
+	options = append(options, client.WithAPIVersionNegotiation())
+	return client.NewClientWithOpts(options...)
+}
+
 func checkDockerInstalled() bool {
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := newDockerClient()
 	if err != nil {
 		return false
 	}
@@ -69,13 +99,17 @@ func checkDockerInstalled() bool {
 }
 
 func startDockerPostgres() error {
+	return startDockerPostgresWithWait(waitForPostgres)
+}
+
+func startDockerPostgresWithWait(waitUntilReady func() error) error {
 	logger.Info("Attempting to create a Docker Postgres container...")
 
 	if !checkDockerInstalled() {
 		return fmt.Errorf("Docker not detected locally. Please install Docker to use this feature")
 	}
 
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := newDockerClient()
 	if err != nil {
 		return fmt.Errorf("failed to create Docker client: %w", err)
 	}
@@ -97,7 +131,7 @@ func startDockerPostgres() error {
 			switch c.State {
 			case "running":
 				logger.Info("Container is already running", "container", containerName)
-				return nil
+				return waitUntilReady()
 			case "exited":
 				// Start the existing container. With AutoRemove=true the
 				// daemon may have already begun removal. Fall through to
@@ -105,7 +139,7 @@ func startDockerPostgres() error {
 				err := cli.ContainerStart(ctx, c.ID, container.StartOptions{})
 				if err == nil {
 					logger.Info("Container was stopped and has been restarted", "container", containerName)
-					return waitForPostgres()
+					return waitUntilReady()
 				}
 				if !isMarkedForRemovalErr(err) {
 					return fmt.Errorf("failed to start existing container: %w", err)
@@ -202,7 +236,7 @@ func startDockerPostgres() error {
 	logger.Info("Created container", "id", resp.ID[:12])
 
 	// Wait for PostgreSQL to be ready
-	if err := waitForPostgres(); err != nil {
+	if err := waitUntilReady(); err != nil {
 		return err
 	}
 
@@ -213,7 +247,7 @@ func startDockerPostgres() error {
 func stopDockerPostgres() error {
 	logger.Info("Stopping Docker Postgres container", "container", containerName)
 
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := newDockerClient()
 	if err != nil {
 		return fmt.Errorf("failed to create Docker client: %w", err)
 	}

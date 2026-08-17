@@ -276,6 +276,30 @@ recvResult, err := recvHandle.GetResult()
 To get started, follow the [quickstart](https://docs.dbos.dev/quickstart) to install this open-source library and connect it to a Postgres database.
 Then, check out the [programming guide](https://docs.dbos.dev/python/programming-guide) to learn how to build with durable workflows and queues.
 
+### Running PostgreSQL-backed tests locally
+
+The repository includes a small harness that starts the local Docker-backed
+PostgreSQL instance when no database URL override is provided, then runs
+`go test`:
+
+```bash
+./scripts/test-postgres.sh -race -count=1 ./...
+```
+
+It defaults to a 30-minute test timeout. Pass `-timeout` (or set
+`DBOS_TEST_TIMEOUT`) to override it, and pass any other `go test` packages or
+flags after the script name. The script does not set or replace
+`DBOS_SYSTEM_DATABASE_URL`, so an existing database URL override is preserved
+and skips local container startup:
+
+```bash
+DBOS_SYSTEM_DATABASE_URL=postgres://user:password@db.example/mydb \
+  ./scripts/test-postgres.sh ./dbos -run TestPostgresConnectionStringForms
+```
+
+Use `dbos postgres stop` when a local database started by the harness is no
+longer needed.
+
 ## Documentation
 
 [https://docs.dbos.dev](https://docs.dbos.dev)
