@@ -844,6 +844,7 @@ type workflowOptions struct {
 	isDequeue           bool
 	isPortableWorkflow  bool
 	runInstance         ConfiguredInstance
+	admissionToken      *workflowAdmissionToken
 	err                 error // invalid option usage, surfaced when options are parsed
 }
 
@@ -962,6 +963,12 @@ func withAlreadyEncodedInput() WorkflowOption {
 func withIsDequeue() WorkflowOption {
 	return func(p *workflowOptions) {
 		p.isDequeue = true
+	}
+}
+
+func withAdmissionToken(token *workflowAdmissionToken) WorkflowOption {
+	return func(p *workflowOptions) {
+		p.admissionToken = token
 	}
 }
 
@@ -1303,6 +1310,15 @@ func (c *dbosContext) RunWorkflow(_ Context, fn WorkflowFunc, input any, opts ..
 		}
 	}
 
+	transferredAdmissionToken := params.admissionToken
+	tokenOwnedByCaller := transferredAdmissionToken != nil
+	rootAdmissionRequired := queueName == "" && !isChildWorkflow && !params.isDequeue && c.admission != nil && c.admission.enabled()
+	defer func() {
+		if tokenOwnedByCaller {
+			transferredAdmissionToken.release()
+		}
+	}()
+
 	var status WorkflowStatusType
 	if queueName != "" {
 		if params.DelayDuration > 0 {
@@ -1605,8 +1621,13 @@ func (c *dbosContext) RunWorkflow(_ Context, fn WorkflowFunc, input any, opts ..
 	}
 
 	c.workflowsWg.Add(1)
-	go func() {
+	go func(admissionToken *workflowAdmissionToken) {
 		defer c.workflowsWg.Done()
+		defer func() {
+			if admissionToken != nil {
+				admissionToken.release()
+			}
+		}()
 
 		removeActive := func() {}
 		if c.activeWorkflowIDs != nil {
@@ -1624,6 +1645,9 @@ func (c *dbosContext) RunWorkflow(_ Context, fn WorkflowFunc, input any, opts ..
 				// active-ID check and here. The winner owns the active entry, so leave it
 				// alone, disarm the durable cancel, and await the winner's result.
 				stopFunc()
+				if admissionToken != nil {
+					admissionToken.release()
+				}
 				c.logger.Warn("Workflow is already executing on this executor. Waiting for the existing execution to complete", "workflow_id", workflowID)
 				awaitExistingOutcome(nil)
 				return
@@ -1632,6 +1656,21 @@ func (c *dbosContext) RunWorkflow(_ Context, fn WorkflowFunc, input any, opts ..
 			removeActive = func() { removeOnce.Do(func() { c.activeWorkflowIDs.Delete(workflowID) }) }
 		}
 		defer removeActive()
+
+		if rootAdmissionRequired {
+			var acquireErr error
+			admissionToken, acquireErr = c.admission.acquire(workflowCtx, admissionQueueKey{}, -1)
+			if acquireErr != nil {
+				if !stopFunc() {
+					<-cancelFuncCompleted
+				} else if workflowCtx.Err() != nil {
+					workflowCancelFunction()
+				}
+				removeActive()
+				awaitExistingOutcome(acquireErr)
+				return
+			}
+		}
 
 		var result any
 		var err error
@@ -1643,6 +1682,9 @@ func (c *dbosContext) RunWorkflow(_ Context, fn WorkflowFunc, input any, opts ..
 			// This run lost the ID conflict: it does not own the workflow, so its
 			// context must no longer durably cancel it. Disarm the cancel function.
 			stopFunc()
+			if admissionToken != nil {
+				admissionToken.release()
+			}
 			c.logger.Warn("Workflow ID conflict detected. Waiting for existing workflow to complete", "workflow_id", workflowID)
 			awaitExistingOutcome(nil)
 			return
@@ -1659,6 +1701,9 @@ func (c *dbosContext) RunWorkflow(_ Context, fn WorkflowFunc, input any, opts ..
 				c.logger.Info("Workflow was cancelled. Waiting for cancel function to complete", "workflow_id", workflowID)
 				<-cancelFuncCompleted
 				removeActive()
+				if admissionToken != nil {
+					admissionToken.release()
+				}
 				// Join the context error into the cause: fn may have learned about the
 				// cancellation by reading the CANCELLED row (a status carries no cause)
 				// rather than from the context, and the run's own reason must not depend
@@ -1671,6 +1716,9 @@ func (c *dbosContext) RunWorkflow(_ Context, fn WorkflowFunc, input any, opts ..
 				// so we need to run the durable cancel ourselves.
 				workflowCancelFunction()
 				removeActive()
+				if admissionToken != nil {
+					admissionToken.release()
+				}
 				awaitExistingOutcome(err)
 				return
 			}
@@ -1716,14 +1764,18 @@ func (c *dbosContext) RunWorkflow(_ Context, fn WorkflowFunc, input any, opts ..
 				// concurrent execution, or handed back to the queue by a resume.
 				// Park the execution and wait for the recorded outcome to become visible.
 				c.logger.Warn("Workflow outcome was not recorded: the workflow is no longer owned by this execution. Waiting for the recorded outcome", "workflow_id", workflowID)
+				if admissionToken != nil {
+					admissionToken.release()
+				}
 				awaitExistingOutcome(err)
 				return
 			}
 		}
 		outcomeChan <- workflowOutcome[any]{result: result, err: err}
 		close(outcomeChan)
-	}()
+	}(transferredAdmissionToken)
 
+	tokenOwnedByCaller = false
 	return newWorkflowHandle(uncancellableCtx, workflowID, outcomeChan), nil
 }
 

@@ -68,6 +68,7 @@ type Config struct {
 	SchedulerPollingInterval     time.Duration         // controls how often dynamic schedules are reconciled with the database (defaults to 30 seconds)
 	SystemDBStartupTimeout       time.Duration         // Maximum time for system-database connection and migrations (defaults to 2 minutes)
 	NotificationCoalesceInterval time.Duration         // Controls how often stream-write and set-event notifications are batched
+	MaxConcurrentWorkflows       int                   // Maximum root workflow functions running in this runtime; zero means unlimited
 	namelessOwner                bool                  // Act for no specific application: write unclaimed rows, matches all. Used by clients without an AppName.
 	isClient                     bool                  // Client handle: runs no workflows, so enqueues leave the version unset by default.
 }
@@ -82,6 +83,9 @@ func processConfig(inputConfig *Config) (*Config, error) {
 	}
 	if len(inputConfig.AppName) == 0 {
 		return nil, fmt.Errorf("missing required config field: appName")
+	}
+	if inputConfig.MaxConcurrentWorkflows < 0 {
+		return nil, fmt.Errorf("maxConcurrentWorkflows cannot be negative")
 	}
 	if inputConfig.SystemDBPool == nil && inputConfig.SQLiteSystemDB == nil {
 		if _, err := sysdb.DetectDialect(inputConfig.DatabaseURL); err != nil {
@@ -119,6 +123,7 @@ func processConfig(inputConfig *Config) (*Config, error) {
 		SchedulerPollingInterval:     inputConfig.SchedulerPollingInterval,
 		SystemDBStartupTimeout:       inputConfig.SystemDBStartupTimeout,
 		NotificationCoalesceInterval: inputConfig.NotificationCoalesceInterval,
+		MaxConcurrentWorkflows:       inputConfig.MaxConcurrentWorkflows,
 		namelessOwner:                inputConfig.namelessOwner,
 		isClient:                     inputConfig.isClient,
 	}
@@ -298,6 +303,7 @@ type dbosContext struct {
 	systemDB    sysdb.SystemDatabase
 	adminServer *adminServer
 	config      *Config
+	admission   *workflowAdmission
 
 	// Queue runner
 	queueRunner        *queueRunner
@@ -403,6 +409,7 @@ func (c *dbosContext) clone(ctx context.Context) *dbosContext {
 		workflowRegistry:        c.workflowRegistry,
 		workflowCustomNametoFQN: c.workflowCustomNametoFQN,
 		activeWorkflowIDs:       c.activeWorkflowIDs,
+		admission:               c.admission,
 		applicationVersion:      c.applicationVersion,
 		executorID:              c.executorID,
 		applicationID:           c.applicationID,
@@ -601,6 +608,7 @@ func NewContext(ctx context.Context, inputConfig Config) (Context, error) {
 		return nil, models.NewInitializationError(err.Error())
 	}
 	initExecutor.config = config
+	initExecutor.admission = newWorkflowAdmission(config.MaxConcurrentWorkflows)
 
 	// Set global logger
 	initExecutor.logger = config.Logger

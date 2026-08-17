@@ -201,6 +201,7 @@ type setupDBOSOptions struct {
 	checkLeaks               bool
 	serializer               Serializer[any]
 	schedulerPollingInterval time.Duration
+	maxConcurrentWorkflows   int
 	databaseURL              string // share another test's database (sqlite URLs are per-*testing.T otherwise)
 	appName                  string // application name (defaults to "test-app")
 }
@@ -229,6 +230,7 @@ func setupDBOS(t *testing.T, opts setupDBOSOptions) Context {
 		AppName:                  appName,
 		Serializer:               opts.serializer,
 		SchedulerPollingInterval: opts.schedulerPollingInterval,
+		MaxConcurrentWorkflows:   opts.maxConcurrentWorkflows,
 	}
 
 	dbosCtx, err := NewContext(context.Background(), config)

@@ -145,8 +145,9 @@ func task(ctx dbos.Context, i int) (int, error) {
 func main() {
     // Initialize a DBOS context
     ctx, err := dbos.NewContext(context.Background(), dbos.Config{
-        DatabaseURL: os.Getenv("DBOS_SYSTEM_DATABASE_URL"),
-        AppName:     "myapp",
+        DatabaseURL:           os.Getenv("DBOS_SYSTEM_DATABASE_URL"),
+        AppName:               "myapp",
+        MaxConcurrentWorkflows: 12,
     })
     if err != nil {
         panic(err)
@@ -187,6 +188,22 @@ func main() {
     fmt.Printf("Successfully completed %d steps\n", len(results))
 }
 ```
+
+`MaxConcurrentWorkflows` bounds root workflow functions running in each DBOS
+runtime. `RunWorkflow` still durably submits an immediate root and returns its
+handle before execution capacity is available, so submissions waiting for a
+permit are not themselves bounded. A running root holds its permit from before
+its workflow function starts until its outcome is durably recorded; durable
+waits do not yield the permit. Queued roots must also satisfy their queue's
+`WorkerConcurrency` limit. Zero preserves the unlimited default.
+
+Immediate child workflows, `dbos.Go` callbacks, and raw goroutines are
+job-internal fanout and do not consume additional root permits. Applications
+that use them own any narrower resource limits they need. A root that awaits a
+queued child can therefore starve when the runtime or queue has no spare worker
+capacity, just as a fixed worker pool can starve when a worker synchronously
+waits for another job from the same pool.
+
 </details>
 
 <details><summary><strong>🎫 Exactly-Once Event Processing</strong></summary>

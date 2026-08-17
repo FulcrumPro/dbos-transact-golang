@@ -14,7 +14,10 @@ import (
 	"github.com/dbos-inc/dbos-transact-golang/dbos/internal/sysdb"
 )
 
-const _DEFAULT_MAX_POLLING_INTERVAL = 120 * time.Second
+const (
+	_DEFAULT_MAX_POLLING_INTERVAL = 120 * time.Second
+	_DEFAULT_DEQUEUE_BATCH_SIZE   = 100
+)
 
 // workflowQueue is the concrete implementation behind the Queue handle: a
 // queue's configuration plus runtime-only registration state.
@@ -31,6 +34,13 @@ type workflowQueue struct {
 
 	databaseBacked bool                    // Whether this queue's config lives in the queues table
 	onConflict     QueueConflictResolution // Registration conflict policy
+}
+
+func (q workflowQueue) workerConcurrencyLimit() int {
+	if q.WorkerConcurrency == nil {
+		return -1
+	}
+	return *q.WorkerConcurrency
 }
 
 // toConfig converts to the persisted representation used by internal/sysdb.
@@ -384,6 +394,9 @@ func (c *dbosContext) RegisterQueue(_ Client, name string, options ...QueueOptio
 		c.logger.Info("Registered database-backed queue", "queue_name", name)
 	}
 	persisted := queueFromConfig(*persistedCfg)
+	if c.admission != nil {
+		c.admission.updateQueueLimit(persisted.Name, persisted.workerConcurrencyLimit())
+	}
 	return &persisted, nil
 }
 
@@ -646,6 +659,11 @@ func (qr *queueRunner) queuesToListen(ctx *dbosContext) map[string]workflowQueue
 	qr.currentMu.Lock()
 	qr.currentQueues = current
 	qr.currentMu.Unlock()
+	if ctx.admission != nil {
+		for _, queue := range current {
+			ctx.admission.updateQueueLimit(queue.Name, queue.workerConcurrencyLimit())
+		}
+	}
 
 	return current
 }
@@ -665,6 +683,11 @@ func (qr *queueRunner) currentQueueConfig(name string) (workflowQueue, bool) {
 	defer qr.currentMu.RUnlock()
 	q, ok := qr.currentQueues[name]
 	return q, ok
+}
+
+type queuedWorkflow struct {
+	workflow       sysdb.DequeuedWorkflow
+	admissionToken *workflowAdmissionToken
 }
 
 func (qr *queueRunner) runQueue(ctx *dbosContext, queue workflowQueue) {
@@ -716,55 +739,25 @@ func (qr *queueRunner) runQueue(ctx *dbosContext, queue workflowQueue) {
 
 		// Dequeue from each partition (or once for non-partitioned queues)
 		if !skipDequeue {
-			var dequeuedWorkflows []sysdb.DequeuedWorkflow
+			dequeuedWorkflows := make([]queuedWorkflow, 0, _DEFAULT_DEQUEUE_BATCH_SIZE)
+			remainingBatch := _DEFAULT_DEQUEUE_BATCH_SIZE
 			for _, partitionKey := range partitionKeys {
-				workflows, shouldContinue := qr.dequeueWorkflows(ctx, queue, partitionKey, &hasBackoffError)
+				if remainingBatch == 0 {
+					break
+				}
+				workflows, shouldContinue := qr.dequeueWorkflows(ctx, queue, partitionKey, &hasBackoffError, remainingBatch)
 				if shouldContinue {
 					continue
 				}
 				dequeuedWorkflows = append(dequeuedWorkflows, workflows...)
+				remainingBatch -= len(workflows)
 			}
 
 			if len(dequeuedWorkflows) > 0 {
 				queueLogger.Debug("Dequeued workflows from queue", "workflows", len(dequeuedWorkflows))
 			}
 			for _, workflow := range dequeuedWorkflows {
-				// Find the workflow in the registry. Configured instance workflows are
-				// registered under a name qualified with their config name.
-				lookupName := workflow.Name
-				if workflow.ConfigName != nil && *workflow.ConfigName != "" {
-					lookupName = instanceQualifiedName(workflow.Name, *workflow.ConfigName)
-				}
-				wfName, ok := ctx.workflowCustomNametoFQN.Load(lookupName)
-				if !ok {
-					queueLogger.Error("Workflow not found in registry", "workflow_name", workflow.Name)
-					continue
-				}
-
-				registeredWorkflowAny, exists := ctx.workflowRegistry.Load(wfName.(string))
-				if !exists {
-					queueLogger.Error("workflow function not found in registry", "workflow_name", workflow.Name)
-					continue
-				}
-				registeredWorkflow, ok := registeredWorkflowAny.(WorkflowRegistryEntry)
-				if !ok {
-					queueLogger.Error("invalid workflow registry entry type", "workflow_name", workflow.Name)
-					continue
-				}
-
-				// Pass encoded input directly - decoding will happen in workflow wrapper when we know the target type
-				// Auth identity is re-attached so child workflows spawned during
-				// the dequeued execution inherit the same identity as the original run.
-				_, err := registeredWorkflow.wrappedFunction(ctx, workflow.Input, workflow.Serialization,
-					WithWorkflowID(workflow.Id),
-					withIsDequeue(),
-					WithAuthenticatedUser(workflow.AuthenticatedUser),
-					WithAssumedRole(workflow.AssumedRole),
-					WithAuthenticatedRoles(workflow.AuthenticatedRoles...),
-				)
-				if err != nil {
-					queueLogger.Error("Error running queued workflow", "error", err)
-				}
+				qr.dispatchWorkflow(ctx, queueLogger, workflow)
 			}
 		}
 
@@ -794,21 +787,103 @@ func (qr *queueRunner) runQueue(ctx *dbosContext, queue workflowQueue) {
 	}
 }
 
+func (qr *queueRunner) dispatchWorkflow(ctx *dbosContext, logger *slog.Logger, queued queuedWorkflow) {
+	transferred := false
+	defer func() {
+		if !transferred && queued.admissionToken != nil {
+			queued.admissionToken.release()
+		}
+	}()
+
+	workflow := queued.workflow
+	lookupName := workflow.Name
+	if workflow.ConfigName != nil && *workflow.ConfigName != "" {
+		lookupName = instanceQualifiedName(workflow.Name, *workflow.ConfigName)
+	}
+	wfName, ok := ctx.workflowCustomNametoFQN.Load(lookupName)
+	if !ok {
+		logger.Error("Workflow not found in registry", "workflow_name", workflow.Name)
+		return
+	}
+
+	registeredWorkflowAny, exists := ctx.workflowRegistry.Load(wfName.(string))
+	if !exists {
+		logger.Error("workflow function not found in registry", "workflow_name", workflow.Name)
+		return
+	}
+	registeredWorkflow, ok := registeredWorkflowAny.(WorkflowRegistryEntry)
+	if !ok {
+		logger.Error("invalid workflow registry entry type", "workflow_name", workflow.Name)
+		return
+	}
+
+	opts := []WorkflowOption{
+		WithWorkflowID(workflow.Id),
+		withIsDequeue(),
+		WithAuthenticatedUser(workflow.AuthenticatedUser),
+		WithAssumedRole(workflow.AssumedRole),
+		WithAuthenticatedRoles(workflow.AuthenticatedRoles...),
+	}
+	if queued.admissionToken != nil {
+		opts = append(opts, withAdmissionToken(queued.admissionToken))
+	}
+	_, err := registeredWorkflow.wrappedFunction(ctx, workflow.Input, workflow.Serialization, opts...)
+	if err != nil {
+		logger.Error("Error running queued workflow", "error", err)
+		return
+	}
+	transferred = true
+}
+
 // dequeueWorkflows dequeues workflows from a specific partition and handles errors.
 // Returns the dequeued workflows and a boolean indicating whether to continue to the next iteration.
-func (qr *queueRunner) dequeueWorkflows(ctx *dbosContext, queue workflowQueue, partitionKey string, hasBackoffError *bool) ([]sysdb.DequeuedWorkflow, bool) {
+func (qr *queueRunner) dequeueWorkflows(ctx *dbosContext, queue workflowQueue, partitionKey string, hasBackoffError *bool, batchBudget int) ([]queuedWorkflow, bool) {
+	if batchBudget <= 0 {
+		return nil, false
+	}
+
+	key := admissionQueueKey{queueName: queue.Name, partitionKey: partitionKey}
+	queueLimit := -1
+	if queue.WorkerConcurrency != nil {
+		queueLimit = *queue.WorkerConcurrency
+	}
+	localRunningCount := ctx.countActiveWorkflowsForQueue(queue.Name, partitionKey)
+	batchLimit := min(batchBudget, _DEFAULT_DEQUEUE_BATCH_SIZE)
+	var reservations []*workflowAdmissionToken
+	if ctx.admission != nil {
+		localRunningCount = ctx.admission.queueCount(key)
+		reservations = make([]*workflowAdmissionToken, 0, batchLimit)
+		for len(reservations) < batchLimit {
+			token, ok := ctx.admission.tryAcquire(key, queueLimit)
+			if !ok {
+				break
+			}
+			reservations = append(reservations, token)
+		}
+		batchLimit = len(reservations)
+	} else if queue.WorkerConcurrency != nil {
+		batchLimit = min(batchLimit, max(*queue.WorkerConcurrency-localRunningCount, 0))
+	}
+	if batchLimit == 0 {
+		return nil, false
+	}
+
 	dequeuedWorkflows, err := sysdb.RetryWithResult(ctx, func() ([]sysdb.DequeuedWorkflow, error) {
 		return ctx.systemDB.DequeueWorkflows(ctx, sysdb.DequeueWorkflowsInput{
 			Queue:                 queue.toConfig(),
 			ExecutorID:            ctx.executorID,
 			ApplicationVersion:    ctx.applicationVersion,
 			QueuePartitionKey:     partitionKey,
-			LocalRunningCount:     ctx.countActiveWorkflowsForQueue(queue.Name, partitionKey),
+			LocalRunningCount:     localRunningCount,
 			RunnableWorkflowsJSON: qr.runnableWorkflowsJSON,
+			MaxTasks:              batchLimit,
 		})
 	}, sysdb.WithRetrierLogger(qr.logger))
 
 	if err != nil {
+		for _, token := range reservations {
+			token.release()
+		}
 		if ctx.systemDB.IsContentionError(err) {
 			*hasBackoffError = true
 		} else {
@@ -817,5 +892,16 @@ func (qr *queueRunner) dequeueWorkflows(ctx *dbosContext, queue workflowQueue, p
 		return nil, true // Indicate to continue to next iteration
 	}
 
-	return dequeuedWorkflows, false // Success, don't continue
+	result := make([]queuedWorkflow, 0, len(dequeuedWorkflows))
+	for i, workflow := range dequeuedWorkflows {
+		var token *workflowAdmissionToken
+		if i < len(reservations) {
+			token = reservations[i]
+		}
+		result = append(result, queuedWorkflow{workflow: workflow, admissionToken: token})
+	}
+	for i := len(dequeuedWorkflows); i < len(reservations); i++ {
+		reservations[i].release()
+	}
+	return result, false
 }

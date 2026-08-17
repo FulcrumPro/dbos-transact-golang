@@ -4729,6 +4729,7 @@ type DequeueWorkflowsInput struct {
 	QueuePartitionKey     string
 	LocalRunningCount     int
 	RunnableWorkflowsJSON string
+	MaxTasks              int
 }
 
 func (s *SysDB) DequeueWorkflows(ctx context.Context, input DequeueWorkflowsInput) ([]DequeuedWorkflow, error) {
@@ -4832,6 +4833,10 @@ func (s *SysDB) DequeueWorkflows(ctx context.Context, input DequeueWorkflowsInpu
 		if availableTasks := max(concurrency-globalCount, 0); maxTasks < 0 || availableTasks < maxTasks {
 			maxTasks = availableTasks
 		}
+	}
+
+	if input.MaxTasks > 0 && (maxTasks < 0 || input.MaxTasks < maxTasks) {
+		maxTasks = input.MaxTasks
 	}
 
 	if maxTasks == 0 {
