@@ -2,6 +2,7 @@ package dbos
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -501,6 +502,11 @@ type queueRunner struct {
 
 	// Channel to signal completion back to the DBOS context
 	completionChan chan struct{}
+
+	// Workflows registered before launch are the only workflows this process can
+	// dispatch. Encode the durable (name, config_name) pairs once so dequeue polls
+	// bind one stable parameter instead of rebuilding an SQL predicate per entry.
+	runnableWorkflowsJSON string
 }
 
 func newQueueRunner(logger *slog.Logger) *queueRunner {
@@ -528,6 +534,23 @@ func newQueueRunner(logger *slog.Logger) *queueRunner {
 // queues registered after launch be picked up without a restart. run blocks
 // until the context is cancelled, then waits for all workers to stop.
 func (qr *queueRunner) run(ctx *dbosContext) {
+	registered := ctx.ListRegisteredWorkflows(ctx)
+	runnableWorkflows := make([][2]string, 0, len(registered))
+	for _, workflow := range registered {
+		name := workflow.Name
+		if name == "" {
+			name = workflow.FQN
+		}
+		runnableWorkflows = append(runnableWorkflows, [2]string{name, workflow.ConfigName})
+	}
+	encodedRunnableWorkflows, err := json.Marshal(runnableWorkflows)
+	if err != nil {
+		// The payload contains only strings, so a marshal failure is an internal
+		// invariant violation rather than a recoverable queue-runner error.
+		panic(fmt.Sprintf("failed to encode runnable workflow registry: %v", err))
+	}
+	qr.runnableWorkflowsJSON = string(encodedRunnableWorkflows)
+
 	defer func() {
 		// Workers stop on context cancellation; wait for them before signalling.
 		qr.queueGoroutinesWg.Wait()
@@ -776,11 +799,12 @@ func (qr *queueRunner) runQueue(ctx *dbosContext, queue workflowQueue) {
 func (qr *queueRunner) dequeueWorkflows(ctx *dbosContext, queue workflowQueue, partitionKey string, hasBackoffError *bool) ([]sysdb.DequeuedWorkflow, bool) {
 	dequeuedWorkflows, err := sysdb.RetryWithResult(ctx, func() ([]sysdb.DequeuedWorkflow, error) {
 		return ctx.systemDB.DequeueWorkflows(ctx, sysdb.DequeueWorkflowsInput{
-			Queue:              queue.toConfig(),
-			ExecutorID:         ctx.executorID,
-			ApplicationVersion: ctx.applicationVersion,
-			QueuePartitionKey:  partitionKey,
-			LocalRunningCount:  ctx.countActiveWorkflowsForQueue(queue.Name, partitionKey),
+			Queue:                 queue.toConfig(),
+			ExecutorID:            ctx.executorID,
+			ApplicationVersion:    ctx.applicationVersion,
+			QueuePartitionKey:     partitionKey,
+			LocalRunningCount:     ctx.countActiveWorkflowsForQueue(queue.Name, partitionKey),
+			RunnableWorkflowsJSON: qr.runnableWorkflowsJSON,
 		})
 	}, sysdb.WithRetrierLogger(qr.logger))
 

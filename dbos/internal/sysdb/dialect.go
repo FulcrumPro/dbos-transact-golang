@@ -444,6 +444,22 @@ func dialectLikeAnyClause(d Dialect, column string, placeholderIdx int) string {
 	return fmt.Sprintf("EXISTS (SELECT 1 FROM json_each($%d) WHERE %s LIKE value)", placeholderIdx, column)
 }
 
+// dialectRunnableWorkflowClause expands one JSON array of [name, config_name]
+// pairs into a two-column relation. Row-value membership keeps the statement
+// shape constant and lets each backend materialize the registry once per query.
+func dialectRunnableWorkflowClause(d Dialect, placeholderIdx int) string {
+	if d.Name() == DialectSQLite {
+		return fmt.Sprintf(`(name, COALESCE(config_name, '')) IN (
+			SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]')
+			FROM json_each($%d)
+		)`, placeholderIdx)
+	}
+	return fmt.Sprintf(`(name, COALESCE(config_name, '')) IN (
+		SELECT value ->> 0, value ->> 1
+		FROM jsonb_array_elements($%d::jsonb)
+	)`, placeholderIdx)
+}
+
 // dialectNoLimitClause returns the LIMIT clause that must precede an OFFSET when
 // no row limit was requested. SQLite rejects a bare OFFSET and uses -1 as its
 // "no limit" sentinel; Postgres accepts a bare OFFSET and so needs nothing.

@@ -4721,14 +4721,21 @@ type DequeuedWorkflow struct {
 }
 
 type DequeueWorkflowsInput struct {
-	Queue              models.QueueConfig
-	ExecutorID         string
-	ApplicationVersion string
-	QueuePartitionKey  string
-	LocalRunningCount  int
+	Queue                 models.QueueConfig
+	ExecutorID            string
+	ApplicationVersion    string
+	QueuePartitionKey     string
+	LocalRunningCount     int
+	RunnableWorkflowsJSON string
 }
 
 func (s *SysDB) DequeueWorkflows(ctx context.Context, input DequeueWorkflowsInput) ([]DequeuedWorkflow, error) {
+	if input.RunnableWorkflowsJSON == "" {
+		return nil, errors.New("runnable workflow registry is required")
+	}
+	if input.RunnableWorkflowsJSON == "[]" {
+		return []DequeuedWorkflow{}, nil
+	}
 	// Snapshot isolation is only required for global concurrency or rate limiting.
 	// Otherwise read committed suffices: worker concurrency is enforced in-memory.
 	snapshot := input.Queue.GlobalConcurrency != nil || input.Queue.RateLimit != nil
@@ -4863,6 +4870,10 @@ func (s *SysDB) DequeueWorkflows(ctx context.Context, input DequeueWorkflowsInpu
 		queryArgs = append(queryArgs, input.QueuePartitionKey)
 		query += fmt.Sprintf(` AND queue_partition_key = $%d`, len(queryArgs))
 	}
+
+	runnableWorkflowsPosition := len(queryArgs) + 1
+	query += " AND " + dialectRunnableWorkflowClause(s.dialect, runnableWorkflowsPosition)
+	queryArgs = append(queryArgs, input.RunnableWorkflowsJSON)
 
 	query += ` ORDER BY priority ASC, created_at ASC`
 

@@ -1025,6 +1025,85 @@ func TestVersionlessDequeueRequiresLatestVersion(t *testing.T) {
 	require.True(t, queueEntriesAreCleanedUp(serverCtx), "expected queue entries to be cleaned up after versionless dequeue test")
 }
 
+func TestQueueLeavesUnregisteredWorkflowEnqueued(t *testing.T) {
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
+
+	runnableWorkflow := func(_ Context, input string) (string, error) {
+		return input, nil
+	}
+	RegisterWorkflow(dbosCtx, runnableWorkflow, WithWorkflowName("RunnableWorkflow"))
+	require.NoError(t, Launch(dbosCtx))
+
+	queue, err := registerWFQ(dbosCtx, "runnable-workflow-queue", WithQueueBasePollingInterval(50*time.Millisecond))
+	require.NoError(t, err)
+
+	unregistered, err := Enqueue[string](dbosCtx, queue.Name, "UnregisteredWorkflow", "unregistered")
+	require.NoError(t, err)
+	runnable, err := RunWorkflow(dbosCtx, runnableWorkflow, "runnable", WithQueue(queue))
+	require.NoError(t, err)
+
+	result, err := runnable.GetResult()
+	require.NoError(t, err)
+	assert.Equal(t, "runnable", result)
+
+	time.Sleep(250 * time.Millisecond)
+	status, err := unregistered.GetStatus()
+	require.NoError(t, err)
+	assert.Equal(t, WorkflowStatusEnqueued, status.Status)
+	assert.Empty(t, status.ExecutorID)
+}
+
+func TestQueueDequeuesOnlyRegisteredWorkflowInstance(t *testing.T) {
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
+
+	registered := &configuredNotifier{channel: "registered"}
+	RegisterWorkflow(dbosCtx, registered.Send, WithInstance(registered))
+	require.NoError(t, Launch(dbosCtx))
+
+	queue, err := registerWFQ(dbosCtx, "registered-instance-queue", WithQueueBasePollingInterval(50*time.Millisecond))
+	require.NoError(t, err)
+	workflowName := resolveWorkflowFunctionName(registered.Send)
+
+	unregistered, err := Enqueue[string](dbosCtx, queue.Name, workflowName, "message", WithEnqueueConfigName("unregistered"))
+	require.NoError(t, err)
+	runnable, err := Enqueue[string](dbosCtx, queue.Name, workflowName, "message", WithEnqueueConfigName(registered.ConfigName()))
+	require.NoError(t, err)
+
+	result, err := runnable.GetResult()
+	require.NoError(t, err)
+	assert.Equal(t, "registered: message", result)
+
+	time.Sleep(250 * time.Millisecond)
+	status, err := unregistered.GetStatus()
+	require.NoError(t, err)
+	assert.Equal(t, WorkflowStatusEnqueued, status.Status)
+	assert.Empty(t, status.ExecutorID)
+}
+
+func TestQueueRunnableRegistryScalesBeyondSQLiteExpressionDepth(t *testing.T) {
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
+
+	const registrySize = 1100
+	var target *configuredNotifier
+	for i := range registrySize {
+		instance := &configuredNotifier{channel: fmt.Sprintf("instance-%04d", i)}
+		RegisterWorkflow(dbosCtx, instance.Send, WithInstance(instance))
+		target = instance
+	}
+	require.Len(t, ListRegisteredWorkflows(dbosCtx), registrySize)
+	require.NoError(t, Launch(dbosCtx))
+
+	queue, err := registerWFQ(dbosCtx, "large-runnable-registry-queue", WithQueueBasePollingInterval(50*time.Millisecond))
+	require.NoError(t, err)
+	workflowName := resolveWorkflowFunctionName(target.Send)
+	handle, err := Enqueue[string](dbosCtx, queue.Name, workflowName, "message", WithEnqueueConfigName(target.ConfigName()))
+	require.NoError(t, err)
+
+	result, err := handle.GetResult()
+	require.NoError(t, err)
+	assert.Equal(t, target.ConfigName()+": message", result)
+}
+
 func TestWorkerConcurrency(t *testing.T) {
 	// Create two contexts that will represent 2 DBOS executors
 	os.Setenv("DBOS__VMID", "worker1")
