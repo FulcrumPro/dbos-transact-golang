@@ -156,6 +156,8 @@ type adminServer struct {
 	logger        *slog.Logger
 	isDeactivated atomic.Int32
 	wg            sync.WaitGroup
+	shutdownOnce  sync.Once
+	shutdownDone  chan struct{}
 }
 
 // toListWorkflowResponse converts a WorkflowStatus to a map with all time fields in UTC
@@ -681,19 +683,21 @@ func (as *adminServer) Shutdown(timeout time.Duration) error {
 		return fmt.Errorf("failed to shutdown admin server: %w", err)
 	}
 
-	// Wait for the server goroutine to return
-	done := make(chan struct{})
-	go func() {
-		as.wg.Wait()
-		close(done)
-	}()
+	// Repeated shutdown calls join the same waiter.
+	as.shutdownOnce.Do(func() {
+		as.shutdownDone = make(chan struct{})
+		go func() {
+			as.wg.Wait()
+			close(as.shutdownDone)
+		}()
+	})
 
 	select {
-	case <-done:
+	case <-as.shutdownDone:
 		as.logger.Info("Admin server shutdown complete")
+		return nil
 	case <-ctx.Done():
 		as.logger.Warn("Admin server shutdown timed out")
+		return fmt.Errorf("timed out waiting for admin server: %w", ctx.Err())
 	}
-
-	return nil
 }

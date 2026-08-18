@@ -7,6 +7,11 @@ import (
 
 // recoverPendingWorkflows re-enqueues pending workflows owned by the specified executors and returns handles to them.
 func recoverPendingWorkflows(ctx *dbosContext, executorIDs []string) ([]WorkflowHandle[any], error) {
+	lease := ctx.beginQueueClaim()
+	if lease == nil {
+		return nil, errDBOSDraining
+	}
+	defer lease.done()
 	recoveredIDs, err := sysdb.RetryWithResult(ctx, func() ([]string, error) {
 		return ctx.systemDB.ReenqueueForRecovery(ctx, executorIDs, ctx.applicationVersion, models.InternalQueueName)
 	}, sysdb.WithRetrierLogger(ctx.logger))

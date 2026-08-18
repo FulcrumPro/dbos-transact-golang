@@ -51,6 +51,7 @@ type conductor struct {
 	needsReconnect atomic.Bool
 	wg             sync.WaitGroup
 	stopOnce       sync.Once
+	shutdownDone   chan struct{}
 	writeMu        sync.Mutex // writeMu protects concurrent writes to the WebSocket connection (pings + handling messages)
 
 	// Connection parameters
@@ -100,6 +101,7 @@ func newConductor(dbosCtx *dbosContext, config conductorConfig) (*conductor, err
 		reconnectWait:    _INITIAL_RECONNECT_WAIT,
 		logger:           dbosCtx.logger.With("service", "conductor"),
 		executorMetadata: config.executorMetadata,
+		shutdownDone:     make(chan struct{}),
 	}
 
 	// Start with needsReconnect set to true so we connect on first run
@@ -109,25 +111,22 @@ func newConductor(dbosCtx *dbosContext, config conductorConfig) (*conductor, err
 }
 
 func (c *conductor) shutdown(timeout time.Duration) error {
-	var err error
 	c.stopOnce.Do(func() {
 		c.closeConn()
-
-		done := make(chan struct{})
 		go func() {
 			c.wg.Wait()
-			close(done)
+			close(c.shutdownDone)
 		}()
-
-		select {
-		case <-done:
-			c.logger.Info("Conductor shut down")
-		case <-time.After(timeout):
-			c.logger.Warn("Timeout waiting for conductor to shut down", "timeout", timeout)
-			err = fmt.Errorf("conductor did not shut down within %v", timeout)
-		}
 	})
-	return err
+
+	select {
+	case <-c.shutdownDone:
+		c.logger.Info("Conductor shut down")
+		return nil
+	case <-time.After(timeout):
+		c.logger.Warn("Timeout waiting for conductor to shut down", "timeout", timeout)
+		return fmt.Errorf("conductor did not shut down within %v", timeout)
+	}
 }
 
 // reconnectWaitWithJitter adds random jitter to the reconnect wait time to prevent thundering herd
@@ -1951,6 +1950,18 @@ func (c *conductor) handleBackfillScheduleRequest(data []byte, requestID string)
 
 	var errorMsg *string
 	var workflowIDs []string
+	producer := c.dbosCtx.beginSchedule()
+	if producer == nil {
+		errorMsg := "DBOS is draining"
+		return c.sendResponse(backfillScheduleConductorResponse{
+			baseResponse: baseResponse{
+				baseMessage:  baseMessage{Type: backfillScheduleMessage, RequestID: requestID},
+				ErrorMessage: &errorMsg,
+			},
+			WorkflowIDs: []string{},
+		}, string(backfillScheduleMessage))
+	}
+	defer producer.done()
 
 	start, err := time.Parse(time.RFC3339Nano, req.Start)
 	if err != nil {
@@ -2004,6 +2015,17 @@ func (c *conductor) handleTriggerScheduleRequest(data []byte, requestID string) 
 
 	var errorMsg *string
 	var workflowID *string
+	producer := c.dbosCtx.beginSchedule()
+	if producer == nil {
+		errorMsg := "DBOS is draining"
+		return c.sendResponse(triggerScheduleConductorResponse{
+			baseResponse: baseResponse{
+				baseMessage:  baseMessage{Type: triggerScheduleMessage, RequestID: requestID},
+				ErrorMessage: &errorMsg,
+			},
+		}, string(triggerScheduleMessage))
+	}
+	defer producer.done()
 	id, err := c.dbosCtx.systemDB.TriggerSchedule(c.dbosCtx, req.ScheduleName)
 	if err != nil {
 		c.logger.Error("Failed to trigger schedule", "schedule_name", req.ScheduleName, "error", err)

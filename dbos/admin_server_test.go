@@ -1226,6 +1226,17 @@ func TestAdminGarbageCollect(t *testing.T) {
 	assert.Equal(t, newHandle.GetWorkflowID(), remaining[0].ID)
 }
 
+func TestAdminShutdownReportsRunningHandler(t *testing.T) {
+	server := &adminServer{
+		server: &http.Server{},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	server.wg.Add(1)
+	require.ErrorContains(t, server.Shutdown(10*time.Millisecond), "timed out waiting for admin server")
+	server.wg.Done()
+	require.NoError(t, server.Shutdown(time.Second))
+}
+
 func mustMarshal(v any) []byte {
 	data, err := json.Marshal(v)
 	if err != nil {

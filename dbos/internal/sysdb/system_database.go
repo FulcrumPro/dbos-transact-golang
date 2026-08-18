@@ -154,6 +154,8 @@ type ExportedWorkflow struct {
 type SysDB struct {
 	pool                 Pool
 	ownsPool             bool
+	poolCloseOnce        sync.Once
+	poolCloseDone        chan struct{}
 	dialect              Dialect
 	notificationLoopMu   sync.Mutex
 	notificationLoopDone chan struct{}
@@ -1194,14 +1196,16 @@ func (s *SysDB) Shutdown(ctx context.Context, timeout time.Duration) []string {
 	}
 
 	if s.pool != nil && s.ownsPool {
-		poolClose := make(chan struct{})
-		go func() {
-			// Will block until every acquired connection is released
-			s.pool.Close()
-			close(poolClose)
-		}()
+		s.poolCloseOnce.Do(func() {
+			s.poolCloseDone = make(chan struct{})
+			go func() {
+				// Will block until every acquired connection is released.
+				s.pool.Close()
+				close(s.poolCloseDone)
+			}()
+		})
 		select {
-		case <-poolClose:
+		case <-s.poolCloseDone:
 		case <-time.After(timeout):
 			s.logger.Warn("System database connection pool did not close in time", "timeout", timeout)
 			pending = append(pending, "connection pool")

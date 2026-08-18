@@ -238,7 +238,7 @@ type Client interface {
 	SetLatestApplicationVersion(_ Client, versionName string) error                         // Mark the named version as latest by bumping its timestamp to now
 	RenameApplication(_ Client, input RenameApplicationInput) (ApplicationRowCounts, error) // Re-own system database rows after an application is renamed
 
-	Shutdown(_ Client, timeout time.Duration) error // Gracefully shutdown all DBOS resources; returns an error if the timeout expired before they all stopped
+	Shutdown(_ Client, timeout time.Duration) error // Interrupt workflows and shut down DBOS resources; call Drain first to let admitted workflows finish
 }
 
 // Context represents a DBOS execution context that provides workflow orchestration capabilities.
@@ -291,6 +291,11 @@ type Context interface {
 	SetAlertHandler(handler AlertHandler) // Register a handler for alerts from DBOS Conductor (must be called before Launch)
 }
 
+type workflowRegistrationLifecycle struct {
+	mu     sync.Mutex
+	closed bool
+}
+
 type dbosContext struct {
 	ctx           context.Context
 	ctxCancelFunc context.CancelCauseFunc
@@ -299,11 +304,15 @@ type dbosContext struct {
 	// Launch and shutdown are permanent, one-shot lifecycle transitions.
 	launchStarted   atomic.Bool
 	shutdownStarted atomic.Bool
+	launchDone      chan struct{}
+	shutdownDone    chan struct{}
+	shutdownResult  error
 
 	systemDB    sysdb.SystemDatabase
 	adminServer *adminServer
 	config      *Config
 	admission   *workflowAdmission
+	lifecycle   *runtimeLifecycle
 
 	// Queue runner
 	queueRunner        *queueRunner
@@ -323,6 +332,10 @@ type dbosContext struct {
 	// Workflow registry - read-mostly sync.Map since registration happens only before launch
 	workflowRegistry        *sync.Map // map[string]WorkflowRegistryEntry
 	workflowCustomNametoFQN *sync.Map // Maps fully qualified workflow names to custom names. Usefor when client enqueues a workflow by name because registry is indexed by FQN.
+	// workflowRegistrationLifecycle is shared by the root context and every derived
+	// context. It closes registration at the same linearization point as Launch so
+	// the queue runner cannot snapshot a partially updated registry.
+	workflowRegistrationLifecycle *workflowRegistrationLifecycle
 
 	// Set of workflow IDs currently running on this context (key = workflow ID, value = activeWorkflowEntry)
 	activeWorkflowIDs *sync.Map
@@ -375,9 +388,17 @@ func SetAlertHandler(ctx Context, handler AlertHandler) {
 // ClearRegistries clears the workflow registry,
 // allowing re-registration of workflows. Intended for testing only.
 func (c *dbosContext) ClearRegistries() {
+	if c.workflowRegistrationLifecycle != nil {
+		c.workflowRegistrationLifecycle.mu.Lock()
+		defer c.workflowRegistrationLifecycle.mu.Unlock()
+	}
 	c.workflowRegistry.Clear()
 	c.workflowCustomNametoFQN.Clear()
 	c.alertHandler = nil
+	// ClearRegistries is test-only; it intentionally reopens registration.
+	if c.workflowRegistrationLifecycle != nil {
+		c.workflowRegistrationLifecycle.closed = false
+	}
 }
 
 func (c *dbosContext) Deadline() (deadline time.Time, ok bool) {
@@ -401,20 +422,22 @@ func (c *dbosContext) Value(key any) any {
 // are deliberately not propagated to derived contexts.
 func (c *dbosContext) clone(ctx context.Context) *dbosContext {
 	childCtx := &dbosContext{
-		ctx:                     ctx,
-		config:                  c.config,
-		logger:                  c.logger,
-		systemDB:                c.systemDB,
-		workflowsWg:             c.workflowsWg,
-		workflowRegistry:        c.workflowRegistry,
-		workflowCustomNametoFQN: c.workflowCustomNametoFQN,
-		activeWorkflowIDs:       c.activeWorkflowIDs,
-		admission:               c.admission,
-		applicationVersion:      c.applicationVersion,
-		executorID:              c.executorID,
-		applicationID:           c.applicationID,
-		queueRunner:             c.queueRunner,
-		serializer:              c.serializer,
+		ctx:                           ctx,
+		config:                        c.config,
+		logger:                        c.logger,
+		systemDB:                      c.systemDB,
+		workflowsWg:                   c.workflowsWg,
+		workflowRegistry:              c.workflowRegistry,
+		workflowCustomNametoFQN:       c.workflowCustomNametoFQN,
+		workflowRegistrationLifecycle: c.workflowRegistrationLifecycle,
+		activeWorkflowIDs:             c.activeWorkflowIDs,
+		admission:                     c.admission,
+		lifecycle:                     c.lifecycle,
+		applicationVersion:            c.applicationVersion,
+		executorID:                    c.executorID,
+		applicationID:                 c.applicationID,
+		queueRunner:                   c.queueRunner,
+		serializer:                    c.serializer,
 	}
 	childCtx.launched.Store(c.launched.Load())
 	return childCtx
@@ -591,15 +614,19 @@ func (c *dbosContext) ListRegisteredWorkflows(_ Context) []WorkflowRegistryEntry
 func NewContext(ctx context.Context, inputConfig Config) (Context, error) {
 	dbosBaseCtx, cancelFunc := context.WithCancelCause(ctx)
 	initExecutor := &dbosContext{
-		workflowsWg:                 &sync.WaitGroup{},
-		ctx:                         dbosBaseCtx,
-		ctxCancelFunc:               cancelFunc,
-		workflowRegistry:            &sync.Map{},
-		workflowCustomNametoFQN:     &sync.Map{},
-		activeWorkflowIDs:           &sync.Map{},
-		workflowScheduler:           cron.New(cron.WithSeconds()),
-		scheduleEntryIDs:            make(map[string]cron.EntryID),
-		scheduleInstalledSignatures: make(map[string]scheduleSignature),
+		workflowsWg:                   &sync.WaitGroup{},
+		ctx:                           dbosBaseCtx,
+		ctxCancelFunc:                 cancelFunc,
+		workflowRegistry:              &sync.Map{},
+		workflowCustomNametoFQN:       &sync.Map{},
+		workflowRegistrationLifecycle: &workflowRegistrationLifecycle{},
+		activeWorkflowIDs:             &sync.Map{},
+		workflowScheduler:             cron.New(cron.WithSeconds()),
+		scheduleEntryIDs:              make(map[string]cron.EntryID),
+		scheduleInstalledSignatures:   make(map[string]scheduleSignature),
+		launchDone:                    make(chan struct{}),
+		shutdownDone:                  make(chan struct{}),
+		lifecycle:                     newRuntimeLifecycle(),
 	}
 
 	// Load and process the configuration
@@ -798,20 +825,28 @@ func (c *dbosContext) requestedOwner(explicit string) *string {
 // A failed Launch is terminal: the context is torn down (system database closed) and
 // cannot be relaunched — create a new context with NewContext and Launch that instead.
 func (c *dbosContext) Launch() error {
-	if !c.launchStarted.CompareAndSwap(false, true) {
+	if !c.beginLaunch() {
 		return models.NewInitializationError("DBOS is already launched")
+	}
+	if c.lifecycle != nil && c.lifecycle.isDraining() {
+		return models.NewInitializationError("DBOS is draining")
 	}
 	launchCompleted := false
 	defer func() {
 		if !launchCompleted {
-			if err := c.Shutdown(c, _LAUNCH_ROLLBACK_TIMEOUT); err != nil {
+			if err := c.shutdownWithLaunchWait(_LAUNCH_ROLLBACK_TIMEOUT, false); err != nil {
 				c.logger.Error("Failed to roll back launch", "error", err)
 			}
 		}
 	}()
+	// Publish launch completion before a rollback joins a concurrent Shutdown.
+	defer close(c.launchDone)
 
 	// Start the system database
 	c.systemDB.Launch(c)
+	if err := c.checkLaunchContext(); err != nil {
+		return err
+	}
 
 	// Register the current application version and warn if it is not the latest.
 	if err := sysdb.Retry(c, func() error {
@@ -826,6 +861,9 @@ func (c *dbosContext) Launch() error {
 		c.logger.Warn("Current application version is not the latest",
 			"current", c.applicationVersion, "latest", latest.Name)
 	}
+	if err := c.checkLaunchContext(); err != nil {
+		return err
+	}
 
 	// Start the admin server if enabled
 	if c.config.AdminServer {
@@ -836,6 +874,9 @@ func (c *dbosContext) Launch() error {
 			return models.NewInitializationError(fmt.Sprintf("failed to start admin server: %v", err))
 		}
 		c.logger.Debug("Admin server started", "port", c.config.AdminServerPort)
+	}
+	if err := c.checkLaunchContext(); err != nil {
+		return err
 	}
 
 	// Recover local pending workflows before starting the queue runner so
@@ -849,17 +890,39 @@ func (c *dbosContext) Launch() error {
 	} else {
 		c.logger.Debug("No pending workflows to recover")
 	}
+	if err := c.checkLaunchContext(); err != nil {
+		return err
+	}
 
 	// Start the queue runner in a goroutine
+	queueStart := c.beginQueueClaim()
+	if queueStart == nil {
+		return models.NewInitializationError("DBOS is draining")
+	}
+	c.queueRunnerStarted.Store(true)
 	go func() {
 		c.queueRunner.run(c)
 	}()
-	c.queueRunnerStarted.Store(true)
+	queueStart.done()
 	c.logger.Debug("Queue runner started")
 
 	// Start the cron scheduler.
+	if err := c.checkLaunchContext(); err != nil {
+		return err
+	}
+	scheduleStart := c.beginSchedule()
+	if scheduleStart == nil {
+		return models.NewInitializationError("DBOS is draining")
+	}
+	c.scheduleMu.Lock()
+	if err := c.checkLaunchContext(); err != nil {
+		c.scheduleMu.Unlock()
+		scheduleStart.done()
+		return err
+	}
 	c.getWorkflowScheduler().Start()
 	c.workflowSchedulerStarted.Store(true)
+	c.scheduleMu.Unlock()
 	c.logger.Debug("Workflow scheduler started")
 
 	// Start the dynamic schedule reconciler. It polls the schedules table every
@@ -869,8 +932,12 @@ func (c *dbosContext) Launch() error {
 		defer c.scheduleReconcilerWg.Done()
 		c.runScheduleReconciler()
 	}()
+	scheduleStart.done()
 
 	// Start the conductor if it has been initialized
+	if err := c.checkLaunchContext(); err != nil {
+		return err
+	}
 	if c.conductor != nil {
 		c.conductor.launch()
 		c.logger.Debug("Conductor started")
@@ -882,8 +949,24 @@ func (c *dbosContext) Launch() error {
 	return nil
 }
 
-// Shutdown gracefully shuts down the DBOS runtime by performing a complete, ordered cleanup
-// of all system components. The shutdown sequence includes:
+func (c *dbosContext) beginLaunch() bool {
+	registration := c.workflowRegistrationLifecycle
+	if registration == nil {
+		panic("DBOS context is missing workflow registration lifecycle")
+	}
+	registration.mu.Lock()
+	defer registration.mu.Unlock()
+
+	if registration.closed || !c.launchStarted.CompareAndSwap(false, true) {
+		return false
+	}
+	registration.closed = true
+	return true
+}
+
+// Shutdown interrupts active workflows and performs an ordered cleanup of all
+// runtime components. Use Drain first when active workflows should finish
+// without cancellation.
 //
 // 1. Cancels the context to signal all resources and workflows to stop.
 // In-flight workflows observe the cancellation and unwind, but are not
@@ -893,120 +976,132 @@ func (c *dbosContext) Launch() error {
 // 3. Stops the workflow scheduler and waits for scheduled jobs to finish
 // 4. Shuts down the admin server
 // 5. Waits for in-flight workflows to finish unwinding
-// 6. Shuts down the system database connection pool and notification listener
-// 7. Shuts down conductor
+// 6. Shuts down conductor
+// 7. Shuts down the system database connection pool and notification listener
 // 8. Marks the context as not launched
 //
-// Each step respects the provided timeout. If any component doesn't shut down within the timeout,
-// a warning is logged and the shutdown continues to the next component.
-//
-// Shutdown is a permanent, one-shot operation and should be called once, when the
-// application is terminating: only the first call performs the shutdown and reports
-// its result; subsequent calls return nil immediately without waiting for it.
+// The timeout bounds the whole call. If it expires, cleanup continues in the
+// background; a later call waits for the same cleanup operation rather than
+// starting another shutdown.
 func (c *dbosContext) Shutdown(_ Client, timeout time.Duration) error {
+	return c.shutdownWithLaunchWait(timeout, true)
+}
+
+func (c *dbosContext) waitForShutdown(timeout time.Duration) error {
+	select {
+	case <-c.shutdownDone:
+		return c.shutdownResult
+	default:
+	}
+	timer := time.NewTimer(max(timeout, 0))
+	defer timer.Stop()
+	select {
+	case <-c.shutdownDone:
+		return c.shutdownResult
+	case <-timer.C:
+		return fmt.Errorf("shutdown timed out after %v waiting for shutdown", timeout)
+	}
+}
+
+func (c *dbosContext) finishShutdown(result error) {
+	c.shutdownResult = result
+	close(c.shutdownDone)
+}
+
+func (c *dbosContext) finishShutdownAfterTimeout(waitForLaunch bool) {
+	if waitForLaunch && c.launchStarted.Load() {
+		<-c.launchDone
+	}
+	if c.adminServer != nil {
+		for c.adminServer.Shutdown(_LAUNCH_ROLLBACK_TIMEOUT) != nil {
+		}
+	}
+	<-c.startDrain(true)
+	if c.conductor != nil {
+		for c.conductor.shutdown(_LAUNCH_ROLLBACK_TIMEOUT) != nil {
+		}
+	}
+
+	if c.systemDB != nil {
+		for {
+			pending := c.systemDB.Shutdown(c, _LAUNCH_ROLLBACK_TIMEOUT)
+			if len(pending) == 0 {
+				break
+			}
+		}
+	}
+	c.launched.Store(false)
+	c.finishShutdown(nil)
+}
+
+func (c *dbosContext) shutdownWithLaunchWait(timeout time.Duration, waitForLaunch bool) error {
 	if !c.shutdownStarted.CompareAndSwap(false, true) {
-		return nil
+		return c.waitForShutdown(timeout)
 	}
 	c.logger.Debug("Shutting down DBOS context")
+	deadline := time.Now().Add(timeout)
+	remaining := func() time.Duration {
+		left := time.Until(deadline)
+		if left < 0 {
+			return 0
+		}
+		return left
+	}
+	wait := func(done <-chan struct{}, name string, pending *[]string) bool {
+		if done == nil {
+			return true
+		}
+		select {
+		case <-done:
+			return true
+		default:
+		}
+		timer := time.NewTimer(remaining())
+		defer timer.Stop()
+		select {
+		case <-done:
+			return true
+		case <-timer.C:
+			*pending = append(*pending, name)
+			return false
+		}
+	}
 
-	// Resources still running when their timeout expired.
 	var pending []string
-
+	// Cancellation must precede every wait for a component that observes c.
 	c.ctxCancelFunc(errShutdown)
+	drainDone := c.startDrain(true)
 
-	// Stop workflow producers before draining in-flight workflows. Producers
-	// (.e.g, queue runner) call RunWorkflow, which calls workflowsWg.Add(1);
-	// waiting on the WaitGroup before they finish races with those Adds.
-	reconcilerDone := make(chan struct{})
-	go func() {
-		c.scheduleReconcilerWg.Wait()
-		close(reconcilerDone)
-	}()
-	select {
-	case <-reconcilerDone:
-		c.logger.Debug("Schedule reconciler completed")
-	case <-time.After(timeout):
-		c.logger.Warn("Timeout waiting for schedule reconciler to complete", "timeout", timeout)
-		pending = append(pending, "schedule reconciler")
+	if waitForLaunch && c.launchStarted.Load() && !wait(c.launchDone, "launch", &pending) {
+		c.launched.Store(false)
+		go c.finishShutdownAfterTimeout(waitForLaunch)
+		return fmt.Errorf("shutdown timed out after %v waiting for: %s", timeout, strings.Join(pending, ", "))
 	}
 
-	// Wait for queue runner to finish
-	if c.queueRunner != nil && c.queueRunnerStarted.Load() {
-		c.logger.Debug("Waiting for queue runner to complete")
-		select {
-		case <-c.queueRunner.completionChan:
-			c.logger.Debug("Queue runner completed")
-			c.queueRunnerStarted.Store(false)
-		case <-time.After(timeout):
-			c.logger.Warn("Timeout waiting for queue runner to complete", "timeout", timeout)
-			pending = append(pending, "queue runner")
-		}
-	}
-
-	// Stop the workflow scheduler and wait until all scheduled workflows are done
-	if c.workflowScheduler != nil && c.workflowSchedulerStarted.Load() {
-		c.logger.Debug("Stopping workflow scheduler")
-		ctx := c.workflowScheduler.Stop()
-		c.workflowSchedulerStarted.Store(false)
-
-		select {
-		case <-ctx.Done():
-			c.logger.Debug("All scheduled jobs completed")
-		case <-time.After(timeout):
-			c.logger.Warn("Timeout waiting for jobs to complete. Moving on", "timeout", timeout)
-			pending = append(pending, "workflow scheduler")
-		}
-	}
-
-	// Shutdown the admin server
 	if c.adminServer != nil {
-		c.logger.Debug("Shutting down admin server")
-		err := c.adminServer.Shutdown(timeout)
-		if err != nil {
-			c.logger.Error("Failed to shutdown admin server", "error", err)
+		if err := c.adminServer.Shutdown(remaining()); err != nil {
 			pending = append(pending, "admin server")
-		} else {
-			c.logger.Debug("Admin server shutdown complete")
 		}
 	}
 
-	// Now that all producers are stopped, wait for in-flight workflows to finish
-	c.logger.Debug("Waiting for all workflows to finish")
-	done := make(chan struct{})
-	go func() {
-		c.workflowsWg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		c.logger.Debug("All workflows completed")
-	case <-time.After(timeout):
-		c.logger.Warn("Timeout waiting for workflows to complete", "timeout", timeout)
-		pending = append(pending, "workflows")
-	}
-
-	// Shutdown the conductor
-	if c.conductor != nil {
-		c.logger.Debug("Shutting down conductor")
-		if err := c.conductor.shutdown(timeout); err != nil {
+	drainComplete := wait(drainDone, "workflows", &pending)
+	if drainComplete && c.conductor != nil {
+		if err := c.conductor.shutdown(remaining()); err != nil {
 			pending = append(pending, "conductor")
 		}
 	}
-
-	// Close the system database
-	if c.systemDB != nil {
-		c.logger.Debug("Shutting down system database")
-		for _, p := range c.systemDB.Shutdown(c, timeout) {
+	if drainComplete && c.systemDB != nil {
+		for _, p := range c.systemDB.Shutdown(c, remaining()) {
 			pending = append(pending, "system database "+p)
 		}
 	}
 
 	c.launched.Store(false)
-
 	if len(pending) > 0 {
-		c.shutdownStarted.Store(false)
+		go c.finishShutdownAfterTimeout(waitForLaunch)
 		return fmt.Errorf("shutdown timed out after %v waiting for: %s", timeout, strings.Join(pending, ", "))
 	}
+	c.finishShutdown(nil)
 	return nil
 }
 

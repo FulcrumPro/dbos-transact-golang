@@ -119,6 +119,11 @@ func (c *dbosContext) addScheduleCronEntry(
 		if !c.launched.Load() {
 			return
 		}
+		producer := c.beginSchedule()
+		if producer == nil {
+			return
+		}
+		defer producer.done()
 		select {
 		case <-ready:
 		case <-c.Done():
@@ -303,11 +308,13 @@ func (c *dbosContext) runScheduleReconciler() {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	for {
+	for c.Err() == nil && c.scheduleProductionAllowed() {
 		c.reconcileSchedules()
 
 		select {
 		case <-c.Done():
+			return
+		case <-c.drainStarted():
 			return
 		case <-ticker.C:
 		}
@@ -360,6 +367,12 @@ func (c *dbosContext) maybeAutomaticBackfill(sched *WorkflowSchedule) {
 }
 
 func (c *dbosContext) reconcileSchedules() {
+	producer := c.beginSchedule()
+	if producer == nil {
+		return
+	}
+	defer producer.done()
+
 	schedules, err := sysdb.RetryWithResult(c, func() ([]WorkflowSchedule, error) {
 		return c.systemDB.ListSchedules(c, sysdb.ListSchedulesDBInput{})
 	}, sysdb.WithRetrierLogger(c.logger))

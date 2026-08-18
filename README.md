@@ -204,6 +204,21 @@ queued child can therefore starve when the runtime or queue has no spare worker
 capacity, just as a fixed worker pool can starve when a worker synchronously
 waits for another job from the same pool.
 
+Before terminating a process, call `dbos.Drain` and then `dbos.Shutdown`.
+Drain stops local queue claims and schedule production, waits for admitted work
+to finish, and is monotonic: a drained process must be restarted before it can
+accept local work again. Already admitted workflows may start immediate child
+workflows while draining, so the set of work being drained remains open until
+those workflow trees stop growing. The timeout bounds that graceful wait.
+
+```golang
+if err := dbos.Drain(ctx, 30*time.Second); err != nil {
+    log.Printf("DBOS drain did not finish: %v", err)
+}
+if err := dbos.Shutdown(ctx, 5*time.Second); err != nil {
+    log.Printf("DBOS shutdown did not finish: %v", err)
+}
+```
 </details>
 
 <details><summary><strong>🎫 Exactly-Once Event Processing</strong></summary>

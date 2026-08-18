@@ -568,7 +568,7 @@ func (qr *queueRunner) run(ctx *dbosContext) {
 		// Workers stop on context cancellation; wait for them before signalling.
 		qr.queueGoroutinesWg.Wait()
 		qr.logger.Debug("All queue goroutines completed")
-		qr.completionChan <- struct{}{}
+		close(qr.completionChan)
 	}()
 
 	// Track a done channel per running worker so we can tell whether a worker has
@@ -577,7 +577,11 @@ func (qr *queueRunner) run(ctx *dbosContext) {
 	workerDone := make(map[string]chan struct{})
 
 	const reconcileInterval = 1 * time.Second
-	for ctx.Err() == nil { // While ctx is not cancelled
+	for ctx.Err() == nil && ctx.queueClaimsAllowed() { // While ctx is not cancelled or draining
+		supervisorLease := ctx.beginQueueClaim()
+		if supervisorLease == nil {
+			return
+		}
 		// Transition any DELAYED workflows whose delay has expired to ENQUEUED.
 		if err := sysdb.Retry(ctx, func() error {
 			return ctx.systemDB.TransitionDelayedWorkflows(ctx)
@@ -604,9 +608,12 @@ func (qr *queueRunner) run(ctx *dbosContext) {
 				qr.runQueue(ctx, q)
 			}(queue, done)
 		}
+		supervisorLease.done()
 
 		select {
 		case <-ctx.Done():
+		case <-ctx.drainStarted():
+			return
 		case <-time.After(reconcileInterval):
 		}
 	}
@@ -688,6 +695,7 @@ func (qr *queueRunner) currentQueueConfig(name string) (workflowQueue, bool) {
 type queuedWorkflow struct {
 	workflow       sysdb.DequeuedWorkflow
 	admissionToken *workflowAdmissionToken
+	claimBatch     *queueClaimBatch
 }
 
 func (qr *queueRunner) runQueue(ctx *dbosContext, queue workflowQueue) {
@@ -695,7 +703,7 @@ func (qr *queueRunner) runQueue(ctx *dbosContext, queue workflowQueue) {
 	// Current polling interval starts at the base interval and adjusts based on errors
 	currentPollingInterval := queue.basePollingInterval
 
-	for {
+	for ctx.Err() == nil && ctx.queueClaimsAllowed() {
 		// Reload database-backed queue configuration each iteration so runtime
 		// changes (concurrency, rate limits, polling cadence) take effect.
 		// If the queue is gone from the set (deleted or no longer listened), stop
@@ -714,7 +722,6 @@ func (qr *queueRunner) runQueue(ctx *dbosContext, queue workflowQueue) {
 			// Keep the current polling interval within the (possibly updated) bounds.
 			currentPollingInterval = max(queue.basePollingInterval, min(currentPollingInterval, queue.maxPollingInterval))
 		}
-
 		hasBackoffError := false
 		skipDequeue := false
 
@@ -781,6 +788,9 @@ func (qr *queueRunner) runQueue(ctx *dbosContext, queue workflowQueue) {
 		case <-ctx.Done():
 			queueLogger.Debug("Queue goroutine stopping due to context cancellation", "cause", context.Cause(ctx))
 			return
+		case <-ctx.drainStarted():
+			queueLogger.Debug("Queue goroutine stopping due to drain")
+			return
 		case <-time.After(sleepDuration):
 			// Continue to next iteration
 		}
@@ -793,6 +803,7 @@ func (qr *queueRunner) dispatchWorkflow(ctx *dbosContext, logger *slog.Logger, q
 		if !transferred && queued.admissionToken != nil {
 			queued.admissionToken.release()
 		}
+		queued.claimBatch.done()
 	}()
 
 	workflow := queued.workflow
@@ -849,6 +860,16 @@ func (qr *queueRunner) dequeueWorkflows(ctx *dbosContext, queue workflowQueue, p
 	}
 	localRunningCount := ctx.countActiveWorkflowsForQueue(queue.Name, partitionKey)
 	batchLimit := min(batchBudget, _DEFAULT_DEQUEUE_BATCH_SIZE)
+	if queue.GlobalConcurrency != nil {
+		batchLimit = min(batchLimit, max(*queue.GlobalConcurrency, 0))
+	}
+	if queue.RateLimit != nil {
+		batchLimit = min(batchLimit, max(queue.RateLimit.Limit, 0))
+	}
+	claimLease := ctx.beginQueueClaim()
+	if claimLease == nil {
+		return nil, true
+	}
 	var reservations []*workflowAdmissionToken
 	if ctx.admission != nil {
 		localRunningCount = ctx.admission.queueCount(key)
@@ -865,6 +886,7 @@ func (qr *queueRunner) dequeueWorkflows(ctx *dbosContext, queue workflowQueue, p
 		batchLimit = min(batchLimit, max(*queue.WorkerConcurrency-localRunningCount, 0))
 	}
 	if batchLimit == 0 {
+		claimLease.done()
 		return nil, false
 	}
 
@@ -881,6 +903,7 @@ func (qr *queueRunner) dequeueWorkflows(ctx *dbosContext, queue workflowQueue, p
 	}, sysdb.WithRetrierLogger(qr.logger))
 
 	if err != nil {
+		claimLease.done()
 		for _, token := range reservations {
 			token.release()
 		}
@@ -891,6 +914,7 @@ func (qr *queueRunner) dequeueWorkflows(ctx *dbosContext, queue workflowQueue, p
 		}
 		return nil, true // Indicate to continue to next iteration
 	}
+	claimBatch := newQueueClaimBatch(claimLease, len(dequeuedWorkflows))
 
 	result := make([]queuedWorkflow, 0, len(dequeuedWorkflows))
 	for i, workflow := range dequeuedWorkflows {
@@ -898,7 +922,7 @@ func (qr *queueRunner) dequeueWorkflows(ctx *dbosContext, queue workflowQueue, p
 		if i < len(reservations) {
 			token = reservations[i]
 		}
-		result = append(result, queuedWorkflow{workflow: workflow, admissionToken: token})
+		result = append(result, queuedWorkflow{workflow: workflow, admissionToken: token, claimBatch: claimBatch})
 	}
 	for i := len(dequeuedWorkflows); i < len(reservations); i++ {
 		reservations[i].release()

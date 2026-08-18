@@ -191,6 +191,14 @@ func newWorkflowPollingHandle[R any](ctx Context, workflowID string) *workflowPo
 	}
 }
 
+func getResultWaitContext(ctx Context) (context.Context, *workflowState) {
+	wfState, _ := ctx.Value(workflowStateKey).(*workflowState)
+	if wfState != nil && wfState.workflowCtx != nil {
+		return wfState.workflowCtx, wfState
+	}
+	return ctx, wfState
+}
+
 // checkGetResultExecution checks if GetResult was already executed as a step within a workflow.
 // Returns (result, found, err). Callers that need workflowState should retrieve it separately.
 func checkGetResultExecution[R any](dbosCtx context.Context) (R, bool, error) {
@@ -253,6 +261,7 @@ func (h *workflowHandle[R]) GetResult(opts ...GetResultOption) (R, error) {
 		return *new(R), err
 	}
 
+	waitCtx, wfState := getResultWaitContext(h.dbosContext)
 	var timeoutChan <-chan time.Time
 	if options.timeout > 0 {
 		timeoutChan = time.After(options.timeout)
@@ -262,14 +271,20 @@ func (h *workflowHandle[R]) GetResult(opts ...GetResultOption) (R, error) {
 	case outcome, ok := <-h.outcomeChan:
 		if !ok {
 			// Return error if channel closed (happens when GetResult() called twice)
-			return *new(R), errors.New("workflow result channel is already closed. Did you call GetResult() twice on the same workflow handle?")
+			err := errors.New("workflow result channel is already closed. Did you call GetResult() twice on the same workflow handle?")
+			return *new(R), err
 		}
 		completedTime := time.Now()
 		return h.processOutcome(outcome, startTime, completedTime)
-	case <-h.dbosContext.Done():
-		return *new(R), context.Cause(h.dbosContext)
+	case <-waitCtx.Done():
+		err := context.Cause(waitCtx)
+		if wfState != nil {
+			err = interruptedStepError(wfState, err)
+		}
+		return *new(R), err
 	case <-timeoutChan:
-		return *new(R), models.NewTimeoutError(h.workflowID, "", fmt.Sprintf("workflow result timeout after %v", options.timeout), context.DeadlineExceeded)
+		err := models.NewTimeoutError(h.workflowID, "", fmt.Sprintf("workflow result timeout after %v", options.timeout), context.DeadlineExceeded)
+		return *new(R), err
 	}
 }
 
@@ -358,11 +373,12 @@ func (h *workflowPollingHandle[R]) GetResult(opts ...GetResultOption) (R, error)
 		return *new(R), err
 	}
 
-	// Use timeout if specified, otherwise use DBOS context directly
-	ctx := h.dbosContext
+	// A child workflow is detached from its parent,
+	// but waiting for its result remains part of the parent execution.
+	ctx, workflowState := getResultWaitContext(h.dbosContext)
 	var cancel context.CancelFunc
 	if options.timeout > 0 {
-		ctx, cancel = WithTimeout(h.dbosContext, options.timeout)
+		ctx, cancel = context.WithTimeoutCause(ctx, options.timeout, errDBOSContextTimeout)
 		defer cancel()
 	}
 
@@ -370,7 +386,6 @@ func (h *workflowPollingHandle[R]) GetResult(opts ...GetResultOption) (R, error)
 	awaitResult, awaitErr := sysdb.RetryWithResult(ctx, func() (*sysdb.AwaitWorkflowResultOutput, error) {
 		return h.dbosContext.(*dbosContext).systemDB.AwaitWorkflowResult(ctx, h.workflowID, options.pollInterval, true)
 	}, sysdb.WithRetrierLogger(h.dbosContext.(*dbosContext).logger))
-
 	completedTime := time.Now()
 
 	// awaitErr is a real DB/network/cancellation error; the workflow's recorded error is in awaitResult.errStr
@@ -379,13 +394,11 @@ func (h *workflowPollingHandle[R]) GetResult(opts ...GetResultOption) (R, error)
 		err = deserializeWorkflowError(awaitResult.ErrStr)
 	}
 
-	workflowState, ok := h.dbosContext.Value(workflowStateKey).(*workflowState)
-	isWithinWorkflow := ok && workflowState != nil
 	// The awaiting workflow being cancelled interrupts the getResult step,
 	// whatever outcome arrived: nothing is checkpointed, so a resume
 	// re-executes the await against the child's then-settled row (a detached
 	// child's recorded success is adopted then).
-	if isWithinWorkflow && isWorkflowCtxCancelled(workflowState) {
+	if workflowState != nil && isWorkflowCtxCancelled(workflowState) {
 		return *new(R), interruptedStepError(workflowState, err)
 	}
 
@@ -418,7 +431,7 @@ func (h *workflowPollingHandle[R]) GetResult(opts ...GetResultOption) (R, error)
 	// If we are calling GetResult inside a workflow, record the outcome as a step
 	// result: either the workflow result proper (no dlq, no raw awaitWorkflowResult
 	// error) or the child's cancellation.
-	if isWithinWorkflow && (childCancelled || (awaitErr == nil && encodedStr != nil)) {
+	if workflowState != nil && (childCancelled || (awaitErr == nil && encodedStr != nil)) {
 		errStr := awaitResult.ErrStr
 		serialization := storedSerialization
 		if childCancelled {
@@ -512,7 +525,14 @@ func registerWorkflow(ctx Context, entry WorkflowRegistryEntry) {
 		return
 	}
 
-	if c.launched.Load() {
+	registration := c.workflowRegistrationLifecycle
+	if registration == nil {
+		panic("DBOS context is missing workflow registration lifecycle")
+	}
+	registration.mu.Lock()
+	defer registration.mu.Unlock()
+
+	if registration.closed || c.launched.Load() {
 		panic("Cannot register workflow after DBOS has launched")
 	}
 
@@ -1269,6 +1289,20 @@ func (c *dbosContext) RunWorkflow(_ Context, fn WorkflowFunc, input any, opts ..
 		}
 	}
 
+	var startLease *workflowStartLease
+	if queueName == "" || params.isDequeue || isChildWorkflow {
+		var err error
+		startLease, err = c.beginWorkflow(queueName == "", isChildWorkflow, params.isDequeue)
+		if err != nil {
+			return nil, models.NewInitializationErrorWithCause(err.Error(), err)
+		}
+		defer func() {
+			if startLease != nil {
+				startLease.abort()
+			}
+		}()
+	}
+
 	// Generate an ID for the workflow if not provided
 	var workflowID string
 	if params.WorkflowID == "" {
@@ -1620,7 +1654,7 @@ func (c *dbosContext) RunWorkflow(_ Context, fn WorkflowFunc, input any, opts ..
 		close(outcomeChan)
 	}
 
-	c.workflowsWg.Add(1)
+	startLease.register()
 	go func(admissionToken *workflowAdmissionToken) {
 		defer c.workflowsWg.Done()
 		defer func() {
@@ -1676,6 +1710,17 @@ func (c *dbosContext) RunWorkflow(_ Context, fn WorkflowFunc, input any, opts ..
 		var err error
 
 		result, err = fn(workflowCtx, input)
+
+		// A drain or shutdown gate can reject new child work after this execution
+		// started. End only the local run and leave its PENDING row recoverable;
+		// recording the gate error would turn a deployment transition into a
+		// terminal workflow failure.
+		lifecycleInterrupted := errors.Is(err, errDBOSDraining) || errors.Is(err, errDBOSShutDown)
+		if lifecycleInterrupted && stopFunc() {
+			outcomeChan <- workflowOutcome[any]{err: err}
+			close(outcomeChan)
+			return
+		}
 
 		// Handle DBOS ID conflict errors by waiting workflow result
 		if errors.Is(err, ErrConflictingWorkflowID) {
@@ -1981,6 +2026,15 @@ func (c *dbosContext) Enqueue(_ Client, queueName, workflowName string, input an
 		if wfState.isWithinStep {
 			return nil, models.NewStepExecutionError(wfState.workflowID, "DBOS.enqueue", fmt.Errorf("cannot call Enqueue within a step"))
 		}
+	}
+	var enqueueLease *workflowStartLease
+	if isWithinWorkflow {
+		var err error
+		enqueueLease, err = c.beginWorkflow(false, true, false)
+		if err != nil {
+			return nil, models.NewInitializationErrorWithCause(err.Error(), err)
+		}
+		defer enqueueLease.abort()
 	}
 
 	workflowID := params.workflowID
@@ -2941,7 +2995,9 @@ func (c *dbosContext) Go(ctx Context, fn StepFunc, opts ...StepOption) (<-chan S
 
 	// Run step inside a Go routine
 	result := make(chan StepOutcome[any], 1)
+	effectLease := c.beginAsyncEffect()
 	go func() {
+		defer effectLease.done()
 		defer close(result)
 		res, err := ctx.RunAsStep(ctx, fn, opts...)
 		result <- StepOutcome[any]{
@@ -4160,12 +4216,17 @@ func (c *dbosContext) Sleep(_ Context, duration time.Duration) (time.Duration, e
 	sleepStart := time.Now()
 	timer := time.NewTimer(remainingDuration)
 	defer timer.Stop()
+	var waitErr error
 	select {
 	case <-timer.C:
 	case <-c.Done():
-		return time.Since(sleepStart), c.Err()
+		waitErr = c.Err()
 	}
-	return remainingDuration, nil
+	slept := remainingDuration
+	if waitErr != nil {
+		slept = time.Since(sleepStart)
+	}
+	return slept, waitErr
 }
 
 // Sleep pauses workflow execution for the specified duration.

@@ -401,6 +401,7 @@ func (c *dbosContext) RunAsTransaction(dbosCtx Context, ds *DataSource, fn TxnFu
 	if fn == nil {
 		return nil, models.NewStepExecutionError(prep.WorkflowID, prep.StepOpts.stepName, fmt.Errorf("transaction function cannot be nil"))
 	}
+
 	if err := ds.setup(c); err != nil {
 		return nil, models.NewStepExecutionError(prep.WorkflowID, prep.StepOpts.stepName, fmt.Errorf("data source %q: %w", ds.name, err))
 	}

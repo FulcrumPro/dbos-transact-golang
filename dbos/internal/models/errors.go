@@ -223,6 +223,10 @@ func NewInitializationError(message string) *Error {
 	}
 }
 
+func NewInitializationErrorWithCause(message string, cause error) *Error {
+	return NewInitializationError(message).withCause(cause)
+}
+
 func NewNonExistentWorkflowError(workflowID string) *Error {
 	return &Error{
 		Message:    fmt.Sprintf("workflow %s does not exist", workflowID),

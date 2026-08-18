@@ -618,7 +618,7 @@ func TestRunWorkflowBeforeLaunchFails(t *testing.T) {
 	assert.Equal(t, "hello", result)
 }
 
-func TestConcurrentShutdownDoesNotWaitTwice(t *testing.T) {
+func TestConcurrentShutdownSharesOneDeadline(t *testing.T) {
 	ctx, err := NewContext(context.Background(), Config{
 		AppName:     "test-concurrent-shutdown",
 		DatabaseURL: "sqlite:" + filepath.Join(t.TempDir(), "dbos.db"),
@@ -648,12 +648,9 @@ func TestConcurrentShutdownDoesNotWaitTwice(t *testing.T) {
 
 	first := <-durations
 	second := <-durations
-	assert.Less(t, min(first, second), timeout/2)
-
-	// Undo the simulated stuck queue runner and close for real: the timed-out
-	// Shutdown returned (unlatched) before closing the system database.
-	dbosCtx.queueRunnerStarted.Store(false)
-	Shutdown(ctx, 5*time.Second)
+	assert.Less(t, max(first, second), timeout+100*time.Millisecond)
+	close(dbosCtx.queueRunner.completionChan)
+	require.NoError(t, Shutdown(ctx, time.Second))
 }
 
 type blockingScheduleListDB struct {
