@@ -1663,9 +1663,9 @@ func (s *SysDB) ListWorkflows(ctx context.Context, input ListWorkflowsDBInput) (
 
 	// Add sorting
 	if input.SortDesc {
-		query += " ORDER BY created_at DESC"
+		query += " ORDER BY created_at DESC, workflow_uuid DESC"
 	} else {
-		query += " ORDER BY created_at ASC"
+		query += " ORDER BY created_at ASC, workflow_uuid ASC"
 	}
 
 	// Add limit and offset

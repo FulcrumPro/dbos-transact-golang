@@ -1154,6 +1154,35 @@ func TestAdminServerAccessConfiguration(t *testing.T) {
 	assert.Equal(t, http.StatusOK, response.Code)
 }
 
+func TestAdminListPaginationValidation(t *testing.T) {
+	intPtr := func(value int) *int { return &value }
+	tests := []struct {
+		name    string
+		request listWorkflowsRequest
+		wantErr bool
+		limit   int
+	}{
+		{name: "default", limit: _ADMIN_SERVER_DEFAULT_PAGE_SIZE},
+		{name: "minimum", request: listWorkflowsRequest{Limit: intPtr(1)}, limit: 1},
+		{name: "maximum", request: listWorkflowsRequest{Limit: intPtr(_ADMIN_SERVER_MAX_PAGE_SIZE)}, limit: _ADMIN_SERVER_MAX_PAGE_SIZE},
+		{name: "zero", request: listWorkflowsRequest{Limit: intPtr(0)}, wantErr: true},
+		{name: "over maximum", request: listWorkflowsRequest{Limit: intPtr(_ADMIN_SERVER_MAX_PAGE_SIZE + 1)}, wantErr: true},
+		{name: "negative offset", request: listWorkflowsRequest{Offset: intPtr(-1)}, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := test.request.validateAndDefault()
+			if test.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, test.request.Limit)
+			assert.Equal(t, test.limit, *test.request.Limit)
+		})
+	}
+}
+
 func mustMarshal(v any) []byte {
 	data, err := json.Marshal(v)
 	if err != nil {

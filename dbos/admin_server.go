@@ -33,6 +33,8 @@ const (
 	_CONDUCTOR_PATTERN                = "GET /conductor"
 
 	_ADMIN_SERVER_READ_HEADER_TIMEOUT = 5 * time.Second
+	_ADMIN_SERVER_DEFAULT_PAGE_SIZE   = 100
+	_ADMIN_SERVER_MAX_PAGE_SIZE       = 1000
 )
 
 // stringOrSlice unmarshals a JSON value that is either a single string ("X")
@@ -134,6 +136,19 @@ func (req *listWorkflowsRequest) toListWorkflowsOptions() []ListWorkflowsOption 
 		opts = append(opts, WithFilterQueueName(*req.QueueName))
 	}
 	return opts
+}
+
+func (req *listWorkflowsRequest) validateAndDefault() error {
+	if req.Limit == nil {
+		limit := _ADMIN_SERVER_DEFAULT_PAGE_SIZE
+		req.Limit = &limit
+	} else if *req.Limit <= 0 || *req.Limit > _ADMIN_SERVER_MAX_PAGE_SIZE {
+		return fmt.Errorf("limit must be between 1 and %d", _ADMIN_SERVER_MAX_PAGE_SIZE)
+	}
+	if req.Offset != nil && *req.Offset < 0 {
+		return fmt.Errorf("offset must be non-negative")
+	}
+	return nil
 }
 
 type adminServer struct {
@@ -372,6 +387,10 @@ func newAdminServer(ctx *dbosContext, host string, port int, middleware AdminSer
 				return
 			}
 		}
+		if err := req.validateAndDefault(); err != nil {
+			http.Error(w, fmt.Sprintf("Invalid pagination: %v", err), http.StatusBadRequest)
+			return
+		}
 
 		workflows, err := ListWorkflows(ctx, req.toListWorkflowsOptions()...)
 		if err != nil {
@@ -440,6 +459,10 @@ func newAdminServer(ctx *dbosContext, host string, port int, middleware AdminSer
 				http.Error(w, fmt.Sprintf("Invalid JSON input: %v", err), http.StatusBadRequest)
 				return
 			}
+		}
+		if err := req.validateAndDefault(); err != nil {
+			http.Error(w, fmt.Sprintf("Invalid pagination: %v", err), http.StatusBadRequest)
+			return
 		}
 
 		filters := req.toListWorkflowsOptions()
