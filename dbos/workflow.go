@@ -368,7 +368,7 @@ func (h *workflowPollingHandle[R]) GetResult(opts ...GetResultOption) (R, error)
 
 	// Here, both the transient DB errors and awaiting the workflow can timeout
 	awaitResult, awaitErr := sysdb.RetryWithResult(ctx, func() (*sysdb.AwaitWorkflowResultOutput, error) {
-		return h.dbosContext.(*dbosContext).systemDB.AwaitWorkflowResult(ctx, h.workflowID, options.pollInterval, false)
+		return h.dbosContext.(*dbosContext).systemDB.AwaitWorkflowResult(ctx, h.workflowID, options.pollInterval, true)
 	}, sysdb.WithRetrierLogger(h.dbosContext.(*dbosContext).logger))
 
 	completedTime := time.Now()

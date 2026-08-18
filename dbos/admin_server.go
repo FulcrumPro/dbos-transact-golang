@@ -341,13 +341,21 @@ func newAdminServer(ctx *dbosContext, host string, port int, middleware AdminSer
 			return
 		}
 
-		// TODO: Implement garbage collection
-		// err := garbageCollect(ctx, inputs.CutoffEpochTimestampMs, inputs.RowsThreshold)
-		// if err != nil {
-		//     ctx.logger.Error("Garbage collection failed", "error", err)
-		//     http.Error(w, fmt.Sprintf("Garbage collection failed: %v", err), http.StatusInternalServerError)
-		//     return
-		// }
+		if inputs.RowsThreshold != nil && *inputs.RowsThreshold <= 0 {
+			http.Error(w, "rows_threshold must be greater than zero", http.StatusBadRequest)
+			return
+		}
+
+		if err := sysdb.Retry(ctx, func() error {
+			return ctx.systemDB.GarbageCollectWorkflows(ctx, sysdb.GarbageCollectWorkflowsInput{
+				CutoffEpochTimestampMs: inputs.CutoffEpochTimestampMs,
+				RowsThreshold:          inputs.RowsThreshold,
+			})
+		}, sysdb.WithRetrierLogger(ctx.logger)); err != nil {
+			ctx.logger.Error("Garbage collection failed", "error", err)
+			http.Error(w, fmt.Sprintf("Garbage collection failed: %v", err), http.StatusInternalServerError)
+			return
+		}
 
 		w.WriteHeader(http.StatusNoContent)
 	})

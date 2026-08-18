@@ -2245,8 +2245,11 @@ func (s *SysDB) GarbageCollectWorkflows(ctx context.Context, input GarbageCollec
 	}
 
 	cutoffTimestamp := input.CutoffEpochTimestampMs
+	var thresholdWorkflowUUID string
 
-	// If rowsThreshold is provided, get the timestamp of the Nth newest workflow
+	// If rowsThreshold is provided, get the key of the Nth newest workflow.
+	// The UUID tie-breaker makes the threshold deterministic when workflows share
+	// the same millisecond-resolution creation timestamp.
 	if input.RowsThreshold != nil {
 		appNameWhere := ""
 		args := []any{*input.RowsThreshold - 1}
@@ -2254,46 +2257,73 @@ func (s *SysDB) GarbageCollectWorkflows(ctx context.Context, input GarbageCollec
 			appNameWhere = " WHERE " + nameFilterSQL("application_name", 2)
 			args = append(args, s.appName)
 		}
-		query := s.RenderSQL(`SELECT created_at
+		query := s.RenderSQL(`SELECT created_at, workflow_uuid
 				  FROM %sworkflow_status`+appNameWhere+`
-				  ORDER BY created_at DESC
+				  ORDER BY created_at DESC, workflow_uuid DESC
 				  LIMIT 1 OFFSET $1`, s.dialect.SchemaPrefix(s.schema))
 
 		var rowsBasedCutoff int64
-		err := s.pool.QueryRow(ctx, query, args...).Scan(&rowsBasedCutoff)
+		err := s.pool.QueryRow(ctx, query, args...).Scan(&rowsBasedCutoff, &thresholdWorkflowUUID)
 		if err != nil && err != pgx.ErrNoRows {
 			return fmt.Errorf("failed to query cutoff timestamp by rows threshold: %w", err)
 		}
-		// If we don't have a provided cutoffTimestamp and found one in the database
-		// Or if the found cutoffTimestamp deletes more (higher timestamp = more recent cutoff = more rows deleted), as needed to enforce the rows threshold
-		// Use the cutoff timestamp found in the database
-		if rowsBasedCutoff > 0 && cutoffTimestamp == nil || (cutoffTimestamp != nil && rowsBasedCutoff > *cutoffTimestamp) {
+		if err == nil {
 			cutoffTimestamp = &rowsBasedCutoff
 		}
 	}
 
-	// If no cutoff is determined, no garbage collection is needed
-	if cutoffTimestamp == nil {
+	// If neither cutoff condition found a row to delete, no garbage collection is
+	// needed. The UUID is populated only when the threshold query succeeded.
+	if cutoffTimestamp == nil && thresholdWorkflowUUID == "" {
 		return nil
 	}
 
-	// Delete all workflows older than cutoff that are NOT PENDING, ENQUEUED, or DELAYED
-	deleteAppNameClause := ""
-	deleteArgs := []any{
-		*cutoffTimestamp,
+	// A terminal child remains part of its parent's durable execution history until
+	// the parent also reaches a terminal state.
+	table := s.dialect.SchemaPrefix(s.schema) + "workflow_status"
+	args := make([]any, 0, 6)
+	cutoffPredicates := make([]string, 0, 2)
+	if input.CutoffEpochTimestampMs != nil {
+		args = append(args, *input.CutoffEpochTimestampMs)
+		cutoffPredicates = append(cutoffPredicates, fmt.Sprintf("candidate.created_at < $%d", len(args)))
+	}
+	if thresholdWorkflowUUID != "" {
+		thresholdCreatedAt := *cutoffTimestamp
+		createdAtParameter := len(args) + 1
+		workflowUUIDParameter := len(args) + 2
+		args = append(args, thresholdCreatedAt, thresholdWorkflowUUID)
+		cutoffPredicates = append(cutoffPredicates, fmt.Sprintf(
+			"(candidate.created_at < $%d OR (candidate.created_at = $%d AND candidate.workflow_uuid < $%d))",
+			createdAtParameter, createdAtParameter, workflowUUIDParameter))
+	}
+	if len(cutoffPredicates) == 0 {
+		return nil
+	}
+
+	statusStartParameter := len(args) + 1
+	args = append(args,
 		models.WorkflowStatusPending,
 		models.WorkflowStatusEnqueued,
-		models.WorkflowStatusDelayed,
-	}
+		models.WorkflowStatusDelayed)
+	appNameClause := ""
 	if s.appName != "" {
-		deleteAppNameClause = " AND " + nameFilterSQL("application_name", 5)
-		deleteArgs = append(deleteArgs, s.appName)
+		args = append(args, s.appName)
+		appNameClause = "\n\t\t\t    AND " + nameFilterSQL("candidate.application_name", len(args))
 	}
-	query := s.RenderSQL(`DELETE FROM %sworkflow_status
-			  WHERE created_at < $1
-			    AND status NOT IN ($2, $3, $4)`+deleteAppNameClause, s.dialect.SchemaPrefix(s.schema))
+	query := s.RenderSQL(fmt.Sprintf(`DELETE FROM %%s AS candidate
+			  WHERE (%s)
+			    AND candidate.status NOT IN ($%d, $%d, $%d)%s
+			    AND NOT EXISTS (
+			      SELECT 1 FROM %%s AS parent
+			      WHERE parent.workflow_uuid = candidate.parent_workflow_id
+			        AND parent.status IN ($%d, $%d, $%d)
+			    )`,
+		strings.Join(cutoffPredicates, " OR "),
+		statusStartParameter, statusStartParameter+1, statusStartParameter+2,
+		appNameClause,
+		statusStartParameter, statusStartParameter+1, statusStartParameter+2), table, table)
 
-	commandTag, err := s.pool.Exec(ctx, query, deleteArgs...)
+	commandTag, err := s.pool.Exec(ctx, query, args...)
 
 	if err != nil {
 		return fmt.Errorf("failed to garbage collect workflows: %w", err)

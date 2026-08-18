@@ -1183,6 +1183,49 @@ func TestAdminListPaginationValidation(t *testing.T) {
 	}
 }
 
+func TestAdminGarbageCollect(t *testing.T) {
+	databaseURL := backendDatabaseURL(t)
+	resetTestDatabase(t, databaseURL)
+	ctx, err := NewContext(context.Background(), Config{
+		DatabaseURL:     databaseURL,
+		AppName:         "test-admin-garbage-collect",
+		AdminServer:     true,
+		AdminServerPort: _DEFAULT_ADMIN_SERVER_PORT,
+	})
+	require.NoError(t, err)
+
+	workflow := func(Context, string) (string, error) { return "done", nil }
+	RegisterWorkflow(ctx, workflow)
+	require.NoError(t, Launch(ctx))
+	t.Cleanup(func() { require.NoError(t, Shutdown(ctx, time.Minute)) })
+
+	oldHandle, err := RunWorkflow(ctx, workflow, "old")
+	require.NoError(t, err)
+	_, err = oldHandle.GetResult()
+	require.NoError(t, err)
+	time.Sleep(2 * time.Millisecond)
+	newHandle, err := RunWorkflow(ctx, workflow, "new")
+	require.NoError(t, err)
+	_, err = newHandle.GetResult()
+	require.NoError(t, err)
+
+	endpoint := fmt.Sprintf("http://localhost:%d/%s", _DEFAULT_ADMIN_SERVER_PORT, strings.TrimPrefix(_GARBAGE_COLLECT_PATTERN, "POST /"))
+	response, err := http.Post(endpoint, "application/json", bytes.NewBufferString(`{"rows_threshold":0}`))
+	require.NoError(t, err)
+	response.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, response.StatusCode)
+
+	response, err = http.Post(endpoint, "application/json", bytes.NewBufferString(`{"rows_threshold":1}`))
+	require.NoError(t, err)
+	response.Body.Close()
+	assert.Equal(t, http.StatusNoContent, response.StatusCode)
+
+	remaining, err := ListWorkflows(ctx, WithFilterWorkflowIDs(oldHandle.GetWorkflowID(), newHandle.GetWorkflowID()))
+	require.NoError(t, err)
+	require.Len(t, remaining, 1)
+	assert.Equal(t, newHandle.GetWorkflowID(), remaining[0].ID)
+}
+
 func mustMarshal(v any) []byte {
 	data, err := json.Marshal(v)
 	if err != nil {
