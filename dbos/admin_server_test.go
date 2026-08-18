@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -1107,6 +1109,49 @@ func TestAdminServer(t *testing.T) {
 			"Expected no new scheduled workflows after deactivate (had %d before, %d after)",
 			countAfterDeactivate, finalCount)
 	})
+}
+
+func TestAdminServerAccessConfiguration(t *testing.T) {
+	processed, err := processConfig(&Config{
+		AppName:     "test-app",
+		DatabaseURL: "sqlite::memory:",
+	})
+	require.NoError(t, err)
+	assert.Empty(t, processed.AdminServerHost)
+
+	ctx := &dbosContext{
+		logger: slog.New(slog.DiscardHandler),
+	}
+	server := newAdminServer(ctx, processed.AdminServerHost, 3001, nil)
+	assert.Equal(t, ":3001", server.server.Addr)
+
+	request := httptest.NewRequest(http.MethodGet, "/dbos-healthz", nil)
+	response := httptest.NewRecorder()
+	server.server.Handler.ServeHTTP(response, request)
+	assert.Equal(t, http.StatusOK, response.Code)
+
+	middleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") != "Bearer secret" {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+	server = newAdminServer(ctx, "127.0.0.1", 3001, middleware)
+	assert.Equal(t, "127.0.0.1:3001", server.server.Addr)
+
+	request = httptest.NewRequest(http.MethodGet, "/dbos-healthz", nil)
+	response = httptest.NewRecorder()
+	server.server.Handler.ServeHTTP(response, request)
+	assert.Equal(t, http.StatusUnauthorized, response.Code)
+
+	request = httptest.NewRequest(http.MethodGet, "/dbos-healthz", nil)
+	request.Header.Set("Authorization", "Bearer secret")
+	response = httptest.NewRecorder()
+	server.server.Handler.ServeHTTP(response, request)
+	assert.Equal(t, http.StatusOK, response.Code)
 }
 
 func mustMarshal(v any) []byte {

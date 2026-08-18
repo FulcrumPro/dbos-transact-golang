@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -34,6 +35,9 @@ const (
 	_LAUNCH_ROLLBACK_TIMEOUT           = 30 * time.Second
 )
 
+// AdminServerMiddleware wraps the admin HTTP handler.
+type AdminServerMiddleware func(http.Handler) http.Handler
+
 // Config holds configuration parameters for initializing a DBOS context.
 // AppName is required, along with exactly one of DatabaseURL, SystemDBPool,
 // or SQLiteSystemDB.
@@ -46,24 +50,26 @@ type Config struct {
 	// SQLite URLs additionally require importing the driver package:
 	// import _ "github.com/dbos-inc/dbos-transact-golang/dbos/driver/sqlite"
 	DatabaseURL                  string
-	SystemDBPool                 *pgxpool.Pool   // SystemDBPool is a custom pg/CRDB pool. Optional; takes precedence over DatabaseURL. Mutually exclusive with SQLiteSystemDB.
-	SQLiteSystemDB               *sql.DB         // SQLiteSystemDB is a custom sqlite handle. Optional; takes precedence over DatabaseURL. Mutually exclusive with SystemDBPool. Requires importing dbos/driver/sqlite.
-	DatabaseSchema               string          // Database schema name (defaults to "dbos")
-	Logger                       *slog.Logger    // Custom logger instance (defaults to a new slog logger)
-	AdminServer                  bool            // Enable Transact admin HTTP server (disabled by default)
-	AdminServerPort              int             // Port for the admin HTTP server (default: 3001)
-	ConductorURL                 string          // DBOS conductor service URL (optional)
-	ConductorAPIKey              string          // DBOS conductor API key (optional)
-	ConductorExecutorMetadata    map[string]any  // Metadata associated with this executor that may be used to identify it on the Conductor dashboard. Must be JSON-serializable.
-	ApplicationVersion           string          // Application version (optional, overridden by DBOS__APPVERSION env var)
-	ExecutorID                   string          // Executor ID (optional, overridden by DBOS__VMID env var)
-	EnablePatching               bool            // Enable the patching system for Patch and DeprecatePatch (default: false)
-	Serializer                   Serializer[any] // Custom serializer for encoding/decoding workflow inputs, outputs, and events (defaults to JSON serializer)
-	SchedulerPollingInterval     time.Duration   // controls how often dynamic schedules are reconciled with the database (defaults to 30 seconds)
-	SystemDBStartupTimeout       time.Duration   // Maximum time for system-database connection and migrations (defaults to 2 minutes)
-	NotificationCoalesceInterval time.Duration   // Controls how often stream-write and set-event notifications are batched
-	namelessOwner                bool            // Act for no specific application: write unclaimed rows, matches all. Used by clients without an AppName.
-	isClient                     bool            // Client handle: runs no workflows, so enqueues leave the version unset by default.
+	SystemDBPool                 *pgxpool.Pool         // SystemDBPool is a custom pg/CRDB pool. Optional; takes precedence over DatabaseURL. Mutually exclusive with SQLiteSystemDB.
+	SQLiteSystemDB               *sql.DB               // SQLiteSystemDB is a custom sqlite handle. Optional; takes precedence over DatabaseURL. Mutually exclusive with SystemDBPool. Requires importing dbos/driver/sqlite.
+	DatabaseSchema               string                // Database schema name (defaults to "dbos")
+	Logger                       *slog.Logger          // Custom logger instance (defaults to a new slog logger)
+	AdminServer                  bool                  // Enable Transact admin HTTP server (disabled by default)
+	AdminServerHost              string                // Host for the admin HTTP server (empty binds all interfaces)
+	AdminServerPort              int                   // Port for the admin HTTP server (default: 3001)
+	AdminServerMiddleware        AdminServerMiddleware // Optional middleware applied to every admin request, including health and readiness
+	ConductorURL                 string                // DBOS conductor service URL (optional)
+	ConductorAPIKey              string                // DBOS conductor API key (optional)
+	ConductorExecutorMetadata    map[string]any        // Metadata associated with this executor that may be used to identify it on the Conductor dashboard. Must be JSON-serializable.
+	ApplicationVersion           string                // Application version (optional, overridden by DBOS__APPVERSION env var)
+	ExecutorID                   string                // Executor ID (optional, overridden by DBOS__VMID env var)
+	EnablePatching               bool                  // Enable the patching system for Patch and DeprecatePatch (default: false)
+	Serializer                   Serializer[any]       // Custom serializer for encoding/decoding workflow inputs, outputs, and events (defaults to JSON serializer)
+	SchedulerPollingInterval     time.Duration         // controls how often dynamic schedules are reconciled with the database (defaults to 30 seconds)
+	SystemDBStartupTimeout       time.Duration         // Maximum time for system-database connection and migrations (defaults to 2 minutes)
+	NotificationCoalesceInterval time.Duration         // Controls how often stream-write and set-event notifications are batched
+	namelessOwner                bool                  // Act for no specific application: write unclaimed rows, matches all. Used by clients without an AppName.
+	isClient                     bool                  // Client handle: runs no workflows, so enqueues leave the version unset by default.
 }
 
 func processConfig(inputConfig *Config) (*Config, error) {
@@ -98,7 +104,9 @@ func processConfig(inputConfig *Config) (*Config, error) {
 		DatabaseSchema:               inputConfig.DatabaseSchema,
 		Logger:                       inputConfig.Logger,
 		AdminServer:                  inputConfig.AdminServer,
+		AdminServerHost:              inputConfig.AdminServerHost,
 		AdminServerPort:              inputConfig.AdminServerPort,
+		AdminServerMiddleware:        inputConfig.AdminServerMiddleware,
 		ConductorURL:                 inputConfig.ConductorURL,
 		ConductorAPIKey:              inputConfig.ConductorAPIKey,
 		ConductorExecutorMetadata:    inputConfig.ConductorExecutorMetadata,
@@ -811,7 +819,7 @@ func (c *dbosContext) Launch() error {
 
 	// Start the admin server if enabled
 	if c.config.AdminServer {
-		c.adminServer = newAdminServer(c, c.config.AdminServerPort)
+		c.adminServer = newAdminServer(c, c.config.AdminServerHost, c.config.AdminServerPort, c.config.AdminServerMiddleware)
 		err := c.adminServer.Start()
 		if err != nil {
 			c.logger.Error("Failed to start admin server", "error", err)

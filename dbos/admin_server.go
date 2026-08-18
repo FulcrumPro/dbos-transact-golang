@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"sync"
@@ -138,7 +139,6 @@ func (req *listWorkflowsRequest) toListWorkflowsOptions() []ListWorkflowsOption 
 type adminServer struct {
 	server        *http.Server
 	logger        *slog.Logger
-	port          int
 	isDeactivated atomic.Int32
 	wg            sync.WaitGroup
 }
@@ -209,10 +209,9 @@ func toListWorkflowResponse(ws WorkflowStatus) (map[string]any, error) {
 	return result, nil
 }
 
-func newAdminServer(ctx *dbosContext, port int) *adminServer {
+func newAdminServer(ctx *dbosContext, host string, port int, middleware AdminServerMiddleware) *adminServer {
 	as := &adminServer{
 		logger: ctx.logger,
-		port:   port,
 	}
 
 	mux := http.NewServeMux()
@@ -612,9 +611,13 @@ func newAdminServer(ctx *dbosContext, port int) *adminServer {
 		}
 	})
 
+	var handler http.Handler = mux
+	if middleware != nil {
+		handler = middleware(handler)
+	}
 	server := &http.Server{
-		Addr:              fmt.Sprintf(":%d", port),
-		Handler:           mux,
+		Addr:              net.JoinHostPort(host, strconv.Itoa(port)),
+		Handler:           handler,
 		ReadHeaderTimeout: _ADMIN_SERVER_READ_HEADER_TIMEOUT,
 	}
 
@@ -623,7 +626,7 @@ func newAdminServer(ctx *dbosContext, port int) *adminServer {
 }
 
 func (as *adminServer) Start() error {
-	as.logger.Info("Starting admin server", "port", as.port)
+	as.logger.Info("Starting admin server", "address", as.server.Addr)
 
 	as.wg.Add(1)
 	go func() {
