@@ -103,7 +103,7 @@ type SystemDatabase interface {
 	DebounceDelayedWorkflow(ctx context.Context, input DebounceDelayedWorkflowDBInput) (*DebounceResult, error)
 	DequeueWorkflows(ctx context.Context, input DequeueWorkflowsInput) ([]DequeuedWorkflow, error)
 	ReenqueueForRecovery(ctx context.Context, executorIDs []string, appVersion string, recoveryQueueName string) ([]string, error)
-	GetQueuePartitions(ctx context.Context, queueName string) ([]string, error)
+	GetQueuePartitions(ctx context.Context, input GetQueuePartitionsInput) ([]string, error)
 
 	// Database-backed queue registry (the queues table)
 	GetQueue(ctx context.Context, name string) (*models.QueueConfig, error) // returns nil if the queue does not exist
@@ -5066,40 +5066,75 @@ func (s *SysDB) ReenqueueForRecovery(ctx context.Context, executorIDs []string, 
 	return workflowIDs, nil
 }
 
-// GetQueuePartitions returns all unique partition keys for enqueued workflows in a queue.
-func (s *SysDB) GetQueuePartitions(ctx context.Context, queueName string) ([]string, error) {
-	appNameClause := ""
-	args := []any{queueName, models.WorkflowStatusEnqueued}
-	if s.appName != "" {
-		args = append(args, s.appName)
-		appNameClause = ` AND ` + nameFilterSQL("application_name", len(args))
-	}
-	query := s.RenderSQL(`
-		SELECT DISTINCT queue_partition_key
-		FROM %sworkflow_status
-		WHERE queue_name = $1
-		  AND status = $2
-		  AND queue_partition_key IS NOT NULL`+appNameClause, s.dialect.SchemaPrefix(s.schema))
+type GetQueuePartitionsInput struct {
+	QueueName         string
+	AfterPartitionKey *string
+	Limit             int
+}
 
-	rows, err := s.pool.Query(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query queue partitions: %w", err)
+// GetQueuePartitions returns a bounded, ordered page of partition keys for
+// enqueued workflows. When AfterPartitionKey is set, the page wraps around so
+// callers can use the last returned key as a round-robin cursor.
+func (s *SysDB) GetQueuePartitions(ctx context.Context, input GetQueuePartitionsInput) ([]string, error) {
+	if input.Limit <= 0 {
+		return nil, fmt.Errorf("queue partition limit must be positive, got %d", input.Limit)
 	}
-	defer rows.Close()
 
-	var partitions []string
-	for rows.Next() {
-		var partitionKey string
-		if err := rows.Scan(&partitionKey); err != nil {
-			return nil, fmt.Errorf("failed to scan partition key: %w", err)
+	queryPage := func(boundary *string, afterBoundary bool, limit int) ([]string, error) {
+		args := []any{input.QueueName, models.WorkflowStatusEnqueued}
+		boundaryClause := ""
+		if boundary != nil {
+			args = append(args, *boundary)
+			operator := "<="
+			if afterBoundary {
+				operator = ">"
+			}
+			boundaryClause = fmt.Sprintf(" AND queue_partition_key %s $%d", operator, len(args))
 		}
-		partitions = append(partitions, partitionKey)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to read queue partitions: %w", err)
+		appNameClause := ""
+		if s.appName != "" {
+			args = append(args, s.appName)
+			appNameClause = ` AND ` + nameFilterSQL("application_name", len(args))
+		}
+		args = append(args, limit)
+		query := s.RenderSQL(`
+			SELECT DISTINCT queue_partition_key
+			FROM %sworkflow_status
+			WHERE queue_name = $1
+			  AND status = $2
+			  AND queue_partition_key IS NOT NULL`+boundaryClause+appNameClause+`
+			ORDER BY queue_partition_key
+			LIMIT $%d`, s.dialect.SchemaPrefix(s.schema), len(args))
+
+		rows, err := s.pool.Query(ctx, query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query queue partitions: %w", err)
+		}
+		defer rows.Close()
+
+		partitions := make([]string, 0, limit)
+		for rows.Next() {
+			var partitionKey string
+			if err := rows.Scan(&partitionKey); err != nil {
+				return nil, fmt.Errorf("failed to scan partition key: %w", err)
+			}
+			partitions = append(partitions, partitionKey)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("failed to read queue partitions: %w", err)
+		}
+		return partitions, nil
 	}
 
-	return partitions, nil
+	partitions, err := queryPage(input.AfterPartitionKey, true, input.Limit)
+	if err != nil || input.AfterPartitionKey == nil || len(partitions) == input.Limit {
+		return partitions, err
+	}
+	wrapper, err := queryPage(input.AfterPartitionKey, false, input.Limit-len(partitions))
+	if err != nil {
+		return nil, err
+	}
+	return append(partitions, wrapper...), nil
 }
 
 /*******************************/

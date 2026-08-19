@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -106,10 +107,20 @@ func (r *fakeRows) Err() error   { return r.err }
 func (r *fakeRows) Close() error { return nil }
 
 type fakeQueryPool struct {
-	rows Rows
+	rows         Rows
+	rowsSequence []Rows
+	queries      []string
+	queryArgs    [][]any
 }
 
 func (p *fakeQueryPool) Query(ctx context.Context, q string, args ...any) (Rows, error) {
+	p.queries = append(p.queries, q)
+	p.queryArgs = append(p.queryArgs, args)
+	if len(p.rowsSequence) > 0 {
+		rows := p.rowsSequence[0]
+		p.rowsSequence = p.rowsSequence[1:]
+		return rows, nil
+	}
 	return p.rows, nil
 }
 
@@ -174,12 +185,65 @@ func TestGetQueuePartitionsSurfacesRowsErr(t *testing.T) {
 		err:  connErr,
 	}
 
-	partitions, err := newFakeSysDB(rows).GetQueuePartitions(context.Background(), "test-queue")
+	partitions, err := newFakeSysDB(rows).GetQueuePartitions(context.Background(), GetQueuePartitionsInput{
+		QueueName: "test-queue",
+		Limit:     10,
+	})
 	if err == nil {
 		t.Fatalf("GetQueuePartitions returned truncated list of %d partition(s) as success; want error", len(partitions))
 	}
 	if !errors.Is(err, connErr) {
 		t.Fatalf("GetQueuePartitions error = %v; want wrapped %v", err, connErr)
+	}
+}
+
+func TestGetQueuePartitionsUsesBoundedCursorPage(t *testing.T) {
+	pool := &fakeQueryPool{rowsSequence: []Rows{
+		&fakeRows{rows: [][]any{{"partition-d"}}},
+		&fakeRows{rows: [][]any{{"partition-a"}}},
+	}}
+	db := &SysDB{
+		pool:    pool,
+		dialect: PostgresDialect{},
+		schema:  "dbos",
+		logger:  slog.New(slog.DiscardHandler),
+	}
+	after := "partition-c"
+
+	partitions, err := db.GetQueuePartitions(context.Background(), GetQueuePartitionsInput{
+		QueueName:         "test-queue",
+		AfterPartitionKey: &after,
+		Limit:             2,
+	})
+	if err != nil {
+		t.Fatalf("GetQueuePartitions returned error: %v", err)
+	}
+	if !reflect.DeepEqual(partitions, []string{"partition-d", "partition-a"}) {
+		t.Fatalf("GetQueuePartitions returned %v; want cursor page with wrap", partitions)
+	}
+	if len(pool.queries) != 2 {
+		t.Fatalf("GetQueuePartitions issued %d queries; want one forward and one wrap query", len(pool.queries))
+	}
+	if !strings.Contains(pool.queries[0], "queue_partition_key > $3") || !strings.Contains(pool.queries[0], "LIMIT $4") {
+		t.Fatalf("forward query is not keyset-bounded: %s", pool.queries[0])
+	}
+	if !strings.Contains(pool.queries[1], "queue_partition_key <= $3") || !strings.Contains(pool.queries[1], "LIMIT $4") {
+		t.Fatalf("wrap query is not keyset-bounded: %s", pool.queries[1])
+	}
+	if got := pool.queryArgs[0][3]; got != 2 {
+		t.Fatalf("forward query limit = %v; want 2", got)
+	}
+	if got := pool.queryArgs[1][3]; got != 1 {
+		t.Fatalf("wrap query limit = %v; want remaining capacity 1", got)
+	}
+}
+
+func TestGetQueuePartitionsRejectsUnboundedRequest(t *testing.T) {
+	_, err := newFakeSysDB(&fakeRows{}).GetQueuePartitions(context.Background(), GetQueuePartitionsInput{
+		QueueName: "test-queue",
+	})
+	if err == nil {
+		t.Fatal("GetQueuePartitions accepted a non-positive limit")
 	}
 }
 

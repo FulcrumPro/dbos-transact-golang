@@ -702,6 +702,7 @@ func (qr *queueRunner) runQueue(ctx *dbosContext, queue workflowQueue) {
 	queueLogger := qr.logger.With("queue_name", queue.Name)
 	// Current polling interval starts at the base interval and adjusts based on errors
 	currentPollingInterval := queue.basePollingInterval
+	var partitionCursor *string
 
 	for ctx.Err() == nil && ctx.queueClaimsAllowed() {
 		// Reload database-backed queue configuration each iteration so runtime
@@ -730,7 +731,11 @@ func (qr *queueRunner) runQueue(ctx *dbosContext, queue workflowQueue) {
 		partitionKeys := []string{""}
 		if queue.PartitionQueue {
 			partitions, err := sysdb.RetryWithResult(ctx, func() ([]string, error) {
-				return ctx.systemDB.GetQueuePartitions(ctx, queue.Name)
+				return ctx.systemDB.GetQueuePartitions(ctx, sysdb.GetQueuePartitionsInput{
+					QueueName:         queue.Name,
+					AfterPartitionKey: partitionCursor,
+					Limit:             _DEFAULT_DEQUEUE_BATCH_SIZE,
+				})
 			}, sysdb.WithRetrierLogger(queueLogger))
 			if err != nil {
 				skipDequeue = true
@@ -746,18 +751,18 @@ func (qr *queueRunner) runQueue(ctx *dbosContext, queue workflowQueue) {
 
 		// Dequeue from each partition (or once for non-partitioned queues)
 		if !skipDequeue {
-			dequeuedWorkflows := make([]queuedWorkflow, 0, _DEFAULT_DEQUEUE_BATCH_SIZE)
-			remainingBatch := _DEFAULT_DEQUEUE_BATCH_SIZE
-			for _, partitionKey := range partitionKeys {
-				if remainingBatch == 0 {
-					break
+			var dequeuedWorkflows []queuedWorkflow
+			if queue.PartitionQueue {
+				var cursor *string
+				dequeuedWorkflows, cursor = dequeuePartitionBatch(partitionKeys, _DEFAULT_DEQUEUE_BATCH_SIZE,
+					func(partitionKey string, batchBudget int) ([]queuedWorkflow, bool) {
+						return qr.dequeueWorkflows(ctx, queue, partitionKey, &hasBackoffError, batchBudget)
+					})
+				if cursor != nil {
+					partitionCursor = cursor
 				}
-				workflows, shouldContinue := qr.dequeueWorkflows(ctx, queue, partitionKey, &hasBackoffError, remainingBatch)
-				if shouldContinue {
-					continue
-				}
-				dequeuedWorkflows = append(dequeuedWorkflows, workflows...)
-				remainingBatch -= len(workflows)
+			} else {
+				dequeuedWorkflows, _ = qr.dequeueWorkflows(ctx, queue, "", &hasBackoffError, _DEFAULT_DEQUEUE_BATCH_SIZE)
 			}
 
 			if len(dequeuedWorkflows) > 0 {
@@ -795,6 +800,74 @@ func (qr *queueRunner) runQueue(ctx *dbosContext, queue workflowQueue) {
 			// Continue to next iteration
 		}
 	}
+}
+
+// dequeuePartitionBatch gives each partition one opportunity before using
+// remaining capacity to fill from partitions that exhausted their allotment.
+// The returned cursor follows actual claims so a small process-wide admission
+// limit cannot make a theoretical cursor stride starve partitions.
+func dequeuePartitionBatch(partitionKeys []string, batchSize int, dequeue func(string, int) ([]queuedWorkflow, bool)) ([]queuedWorkflow, *string) {
+	if len(partitionKeys) == 0 || batchSize <= 0 {
+		return nil, nil
+	}
+
+	dequeued := make([]queuedWorkflow, 0, batchSize)
+	remaining := batchSize
+	candidates := partitionKeys
+	firstPass := true
+	var lastAwarded *string
+
+	for remaining > 0 && len(candidates) > 0 {
+		nextCandidates := make([]string, 0, len(candidates))
+		madeProgress := false
+		for i, partitionKey := range candidates {
+			if remaining == 0 {
+				break
+			}
+			budget := 1
+			if !firstPass {
+				budget = fairPartitionBatchBudget(remaining, len(candidates)-i)
+			}
+			workflows, skip := dequeue(partitionKey, budget)
+			if skip {
+				continue
+			}
+			if len(workflows) > budget {
+				panic(fmt.Sprintf("partition dequeue returned %d workflows for budget %d", len(workflows), budget))
+			}
+			dequeued = append(dequeued, workflows...)
+			remaining -= len(workflows)
+			if len(workflows) > 0 {
+				madeProgress = true
+				cursor := partitionKey
+				lastAwarded = &cursor
+			}
+			if len(workflows) == budget {
+				nextCandidates = append(nextCandidates, partitionKey)
+			}
+		}
+		if !madeProgress {
+			break
+		}
+		candidates = nextCandidates
+		firstPass = false
+	}
+
+	if lastAwarded != nil {
+		return dequeued, lastAwarded
+	}
+	// No partition produced work. Skip the entire examined page so a page of
+	// unrunnable partitions cannot make later runnable partitions wait one poll
+	// per key.
+	cursor := partitionKeys[len(partitionKeys)-1]
+	return dequeued, &cursor
+}
+
+func fairPartitionBatchBudget(remainingBatch, remainingPartitions int) int {
+	if remainingBatch <= 0 || remainingPartitions <= 0 {
+		return 0
+	}
+	return (remainingBatch + remainingPartitions - 1) / remainingPartitions
 }
 
 func (qr *queueRunner) dispatchWorkflow(ctx *dbosContext, logger *slog.Logger, queued queuedWorkflow) {

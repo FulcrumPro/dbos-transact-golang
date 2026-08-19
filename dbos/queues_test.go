@@ -1932,6 +1932,144 @@ func TestNewQueueRunner(t *testing.T) {
 	})
 }
 
+func TestFairPartitionBatchBudget(t *testing.T) {
+	tests := []struct {
+		name                string
+		remainingBatch      int
+		remainingPartitions int
+		want                int
+	}{
+		{name: "one slot per partition", remainingBatch: 100, remainingPartitions: 100, want: 1},
+		{name: "split a batch evenly", remainingBatch: 100, remainingPartitions: 2, want: 50},
+		{name: "round up", remainingBatch: 5, remainingPartitions: 2, want: 3},
+		{name: "give spare capacity to the last partition", remainingBatch: 99, remainingPartitions: 1, want: 99},
+		{name: "no remaining batch", remainingBatch: 0, remainingPartitions: 10, want: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := fairPartitionBatchBudget(tt.remainingBatch, tt.remainingPartitions); got != tt.want {
+				t.Fatalf("fairPartitionBatchBudget(%d, %d) = %d; want %d", tt.remainingBatch, tt.remainingPartitions, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDequeuePartitionBatchFairAndWorkConserving(t *testing.T) {
+	partitionKeys := make([]string, 60)
+	for i := range partitionKeys {
+		partitionKeys[i] = fmt.Sprintf("partition-%02d", i)
+	}
+	claims := make(map[string]int, len(partitionKeys))
+
+	workflows, cursor := dequeuePartitionBatch(partitionKeys, 100, func(partitionKey string, budget int) ([]queuedWorkflow, bool) {
+		claims[partitionKey] += budget
+		return make([]queuedWorkflow, budget), false
+	})
+
+	require.Len(t, workflows, 100)
+	require.NotNil(t, cursor)
+	assert.Equal(t, "partition-39", *cursor)
+	for _, partitionKey := range partitionKeys {
+		assert.GreaterOrEqual(t, claims[partitionKey], 1, "partition missed the first pass")
+		assert.LessOrEqual(t, claims[partitionKey], 2, "partition received more than its fair share")
+	}
+}
+
+func TestDequeuePartitionBatchFillsUnusedCapacity(t *testing.T) {
+	partitionKeys := make([]string, 100)
+	partitionKeys[0] = "hot"
+	for i := 1; i < len(partitionKeys); i++ {
+		partitionKeys[i] = fmt.Sprintf("unrunnable-%03d", i)
+	}
+	var hotBudgets []int
+
+	workflows, cursor := dequeuePartitionBatch(partitionKeys, 100, func(partitionKey string, budget int) ([]queuedWorkflow, bool) {
+		if partitionKey != "hot" {
+			return nil, false
+		}
+		hotBudgets = append(hotBudgets, budget)
+		return make([]queuedWorkflow, budget), false
+	})
+
+	require.Len(t, workflows, 100)
+	assert.Equal(t, []int{1, 99}, hotBudgets)
+	require.NotNil(t, cursor)
+	assert.Equal(t, "hot", *cursor)
+}
+
+func TestDequeuePartitionBatchCursorFollowsActualClaims(t *testing.T) {
+	partitionKeys := make([]string, 60)
+	for i := range partitionKeys {
+		partitionKeys[i] = fmt.Sprintf("partition-%02d", i)
+	}
+	capacity := 1
+
+	workflows, cursor := dequeuePartitionBatch(partitionKeys, 100, func(_ string, _ int) ([]queuedWorkflow, bool) {
+		if capacity == 0 {
+			return nil, false
+		}
+		capacity--
+		return make([]queuedWorkflow, 1), false
+	})
+
+	require.Len(t, workflows, 1)
+	require.NotNil(t, cursor)
+	assert.Equal(t, "partition-00", *cursor)
+
+	_, cursor = dequeuePartitionBatch(partitionKeys, 100, func(_ string, _ int) ([]queuedWorkflow, bool) {
+		return nil, false
+	})
+	require.NotNil(t, cursor)
+	assert.Equal(t, "partition-59", *cursor, "a no-op poll should advance past the examined page")
+}
+
+func TestGetQueuePartitionsBoundedRoundRobin(t *testing.T) {
+	ctx := setupDBOS(t, setupDBOSOptions{dropDB: true})
+	dbosCtx := ctx.(*dbosContext)
+	dialect := dbosCtx.systemDB.Dialect()
+	insert := dialect.RewriteQuery(fmt.Sprintf(`
+		INSERT INTO %sworkflow_status (
+			workflow_uuid, status, name, created_at, updated_at,
+			queue_name, queue_partition_key, application_name
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		dialect.SchemaPrefix(_DEFAULT_SYSTEM_DB_SCHEMA)))
+	for i := range 150 {
+		partitionKey := fmt.Sprintf("partition-%03d", i)
+		_, err := dbosCtx.systemDB.Pool().Exec(ctx, insert,
+			"workflow-"+partitionKey,
+			models.WorkflowStatusEnqueued,
+			"workflow",
+			int64(i),
+			int64(i),
+			"partitioned-queue",
+			partitionKey,
+			"test-app",
+		)
+		require.NoError(t, err)
+	}
+
+	first, err := dbosCtx.systemDB.GetQueuePartitions(ctx, sysdb.GetQueuePartitionsInput{
+		QueueName: "partitioned-queue",
+		Limit:     100,
+	})
+	require.NoError(t, err)
+	require.Len(t, first, 100)
+	assert.Equal(t, "partition-000", first[0])
+	assert.Equal(t, "partition-099", first[99])
+
+	second, err := dbosCtx.systemDB.GetQueuePartitions(ctx, sysdb.GetQueuePartitionsInput{
+		QueueName:         "partitioned-queue",
+		AfterPartitionKey: &first[99],
+		Limit:             100,
+	})
+	require.NoError(t, err)
+	require.Len(t, second, 100)
+	assert.Equal(t, "partition-100", second[0])
+	assert.Equal(t, "partition-149", second[49])
+	assert.Equal(t, "partition-000", second[50])
+	assert.Equal(t, "partition-049", second[99])
+}
+
 func TestQueuePollingIntervals(t *testing.T) {
 	t.Run("queue uses default intervals when not specified", func(t *testing.T) {
 		ctx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: false})
