@@ -3378,6 +3378,8 @@ type GetWorkflowAggregatesDBInput struct {
 	HasParent                 *bool
 	Attributes                map[string]any
 	Limit                     int64 // 0 means use _DEFAULT_AGGREGATES_LIMIT
+	Offset                    int64
+	SortByCountDesc           bool
 	Tx                        Tx
 }
 
@@ -3559,11 +3561,23 @@ func (s *SysDB) GetWorkflowAggregates(ctx context.Context, input GetWorkflowAggr
 		query += " WHERE " + strings.Join(qb.whereClauses, " AND ")
 	}
 	query += " GROUP BY " + strings.Join(groupParts, ", ")
+	orderParts := make([]string, 0, len(groups)+1)
+	if input.SortByCountDesc {
+		if !input.SelectCount {
+			return nil, errors.New("SortByCountDesc requires SelectCount")
+		}
+		// Count is the first selected aggregate whenever enabled.
+		orderParts = append(orderParts, "s0 DESC")
+	}
+	for i := range groups {
+		orderParts = append(orderParts, fmt.Sprintf("g%d ASC", i))
+	}
+	query += " ORDER BY " + strings.Join(orderParts, ", ")
 	limit := input.Limit
 	if limit <= 0 {
 		limit = _DEFAULT_AGGREGATES_LIMIT
 	}
-	query += fmt.Sprintf(" LIMIT %d", limit)
+	query += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, input.Offset)
 
 	var rows Rows
 	var err error

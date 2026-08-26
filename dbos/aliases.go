@@ -196,7 +196,8 @@ type (
 
 	// GetWorkflowAggregatesInput is the input to GetWorkflowAggregates. At
 	// least one GroupBy* flag must be true or TimeBucketSize must be > 0, and
-	// at least one Select* flag must be true.
+	// at least one Select* flag must be true. Limit and Offset page the grouped
+	// rows; SortByCountDesc requires SelectCount.
 	GetWorkflowAggregatesInput = models.GetWorkflowAggregatesInput
 
 	// GetStepAggregatesInput is the input to GetStepAggregates. At least one

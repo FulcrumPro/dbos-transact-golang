@@ -9559,6 +9559,33 @@ func TestGetWorkflowAggregates(t *testing.T) {
 		assert.Equal(t, int64(2), statusCounts[string(WorkflowStatusError)])
 	})
 
+	t.Run("PaginationByCount", func(t *testing.T) {
+		first, err := GetWorkflowAggregates(dbosCtx, GetWorkflowAggregatesInput{
+			GroupByStatus:   true,
+			SelectCount:     true,
+			SortByCountDesc: true,
+			Limit:           1,
+		})
+		require.NoError(t, err)
+		require.Len(t, first, 1)
+		require.NotNil(t, first[0].Group["status"])
+		assert.Equal(t, string(WorkflowStatusSuccess), *first[0].Group["status"])
+		assert.Equal(t, int64(3), *first[0].Count)
+
+		second, err := GetWorkflowAggregates(dbosCtx, GetWorkflowAggregatesInput{
+			GroupByStatus:   true,
+			SelectCount:     true,
+			SortByCountDesc: true,
+			Limit:           1,
+			Offset:          1,
+		})
+		require.NoError(t, err)
+		require.Len(t, second, 1)
+		require.NotNil(t, second[0].Group["status"])
+		assert.Equal(t, string(WorkflowStatusError), *second[0].Group["status"])
+		assert.Equal(t, int64(2), *second[0].Count)
+	})
+
 	t.Run("GroupByName", func(t *testing.T) {
 		rows, err := GetWorkflowAggregates(dbosCtx, GetWorkflowAggregatesInput{GroupByName: true, SelectCount: true})
 		require.NoError(t, err)

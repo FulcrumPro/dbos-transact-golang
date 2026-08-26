@@ -98,6 +98,12 @@ type GetWorkflowAggregatesInput struct {
 	// When non-zero, groups results by created_at time bucket of this size.
 	TimeBucketSize time.Duration
 
+	// Pagination is applied after grouping. SortByCountDesc requires
+	// SelectCount and orders equal counts by the grouping columns.
+	Limit           int
+	Offset          int
+	SortByCountDesc bool
+
 	// Filters
 	Status             []WorkflowStatusType
 	StartTime          time.Time

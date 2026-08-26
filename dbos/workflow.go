@@ -846,26 +846,26 @@ const (
 )
 
 type workflowOptions struct {
-	WorkflowName        string
-	WorkflowID          string
-	queue               Queue
-	ApplicationVersion  string
-	MaxRetries          int
-	DeduplicationID     string
-	DeduplicationPolicy DeduplicationPolicy
-	Priority            uint
-	AuthenticatedUser   string
-	AssumedRole         string
-	AuthenticatedRoles  []string
-	QueuePartitionKey   string
-	DelayDuration       time.Duration
-	WorkflowAttributes  map[string]any
-	alreadyEncodedInput bool
-	isDequeue           bool
-	isPortableWorkflow  bool
-	runInstance         ConfiguredInstance
-	admissionToken      *workflowAdmissionToken
-	err                 error // invalid option usage, surfaced when options are parsed
+	WorkflowName         string
+	WorkflowID           string
+	queue                Queue
+	ApplicationVersion   string
+	MaxRetries           int
+	DeduplicationID      string
+	DeduplicationPolicy  DeduplicationPolicy
+	Priority             uint
+	AuthenticatedUser    string
+	AssumedRole          string
+	AuthenticatedRoles   []string
+	QueuePartitionKey    string
+	DelayDuration        time.Duration
+	WorkflowAttributes   map[string]any
+	alreadyEncodedInput  bool
+	isDequeue            bool
+	isPortableWorkflow   bool
+	runInstance          ConfiguredInstance
+	admissionToken       *workflowAdmissionToken
+	err                  error // invalid option usage, surfaced when options are parsed
 }
 
 // WorkflowOption is a functional option for configuring workflow execution parameters.
@@ -1194,7 +1194,6 @@ func (c *dbosContext) RunWorkflow(_ Context, fn WorkflowFunc, input any, opts ..
 	if len(registeredWorkflow.Name) > 0 {
 		params.WorkflowName = registeredWorkflow.Name
 	}
-
 	// The queue, if any, comes from the WithQueue handle (Enqueue is the name-only path)
 	var queueName string
 	if params.queue != nil {
@@ -5606,6 +5605,15 @@ func (c *dbosContext) GetWorkflowAggregates(_ Client, input GetWorkflowAggregate
 	if input.TimeBucketSize < 0 {
 		return nil, errors.New("TimeBucketSize must be >= 0")
 	}
+	if input.Limit < 0 {
+		return nil, errors.New("Limit must be >= 0")
+	}
+	if input.Offset < 0 {
+		return nil, errors.New("Offset must be >= 0")
+	}
+	if input.SortByCountDesc && !input.SelectCount {
+		return nil, errors.New("SortByCountDesc requires SelectCount")
+	}
 	dbInput := sysdb.GetWorkflowAggregatesDBInput{
 		GroupByStatus:             input.GroupByStatus,
 		GroupByName:               input.GroupByName,
@@ -5638,6 +5646,9 @@ func (c *dbosContext) GetWorkflowAggregates(_ Client, input GetWorkflowAggregate
 		WasForkedFrom:             input.WasForkedFrom,
 		HasParent:                 input.HasParent,
 		Attributes:                input.Attributes,
+		Limit:                     int64(input.Limit),
+		Offset:                    int64(input.Offset),
+		SortByCountDesc:           input.SortByCountDesc,
 	}
 
 	workflowState, ok := c.Value(workflowStateKey).(*workflowState)
@@ -5669,7 +5680,9 @@ func (c *dbosContext) GetWorkflowAggregates(_ Client, input GetWorkflowAggregate
 // "time_bucket"). Map values are
 // pointers to allow representing NULL grouping values (e.g. workflows without a queue_name).
 // Count, MinCreatedAt, MaxQueueWaitMs and MaxTotalLatencyMs are populated only for the
-// corresponding enabled Select* flag; the rest are nil.
+// corresponding enabled Select* flag; the rest are nil. Limit and Offset page
+// the grouped rows. SortByCountDesc orders by Count descending and then by the
+// grouping columns, and therefore requires SelectCount.
 //
 // Example:
 //
