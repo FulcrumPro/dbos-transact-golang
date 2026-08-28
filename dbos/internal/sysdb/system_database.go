@@ -3331,13 +3331,14 @@ func (s *SysDB) GetWorkflowSteps(ctx context.Context, input GetWorkflowStepsInpu
 // Count, MinCreatedAt, MaxQueueWaitMs and MaxTotalLatencyMs are pointers because the caller
 // selects which aggregates to compute; an unselected aggregate is nil (serialized as null,
 // matching the other SDKs). MinCreatedAt is an epoch-ms timestamp; the latency fields are
-// in milliseconds.
+// in milliseconds. TotalGroups is the total number of grouped rows before Limit and Offset.
 type WorkflowAggregateRow struct {
 	Group             map[string]*string `json:"group"`
 	Count             *int64             `json:"count"`
 	MinCreatedAt      *int64             `json:"min_created_at"`
 	MaxQueueWaitMs    *int64             `json:"max_queue_wait_ms"`
 	MaxTotalLatencyMs *int64             `json:"max_total_latency_ms"`
+	TotalGroups       int64              `json:"total_groups"`
 }
 
 // _DEFAULT_AGGREGATES_LIMIT caps the number of group rows returned by getWorkflowAggregates
@@ -3543,7 +3544,7 @@ func (s *SysDB) GetWorkflowAggregates(ctx context.Context, input GetWorkflowAggr
 
 	// Build SELECT clause: each group expression aliased to "g0", "g1", ... so the position is stable
 	// regardless of whether the expression is a column or a CAST(...) expression.
-	selectParts := make([]string, 0, len(groups)+len(selects))
+	selectParts := make([]string, 0, len(groups)+len(selects)+1)
 	groupParts := make([]string, 0, len(groups))
 	for i, g := range groups {
 		alias := fmt.Sprintf("g%d", i)
@@ -3553,6 +3554,7 @@ func (s *SysDB) GetWorkflowAggregates(ctx context.Context, input GetWorkflowAggr
 	for i, sel := range selects {
 		selectParts = append(selectParts, fmt.Sprintf("%s AS s%d", sel.expr, i))
 	}
+	selectParts = append(selectParts, "COUNT(*) OVER() AS total_groups")
 
 	query := fmt.Sprintf("SELECT %s FROM %sworkflow_status",
 		strings.Join(selectParts, ", "),
@@ -3604,7 +3606,8 @@ func (s *SysDB) GetWorkflowAggregates(ctx context.Context, input GetWorkflowAggr
 			var v *int64
 			selectVals[i] = &v
 		}
-		scanArgs := append(append([]any{}, groupVals...), selectVals...)
+		var totalGroups int64
+		scanArgs := append(append(append([]any{}, groupVals...), selectVals...), &totalGroups)
 		if err := rows.Scan(scanArgs...); err != nil {
 			return nil, fmt.Errorf("failed to scan workflow aggregate row: %w", err)
 		}
@@ -3612,7 +3615,7 @@ func (s *SysDB) GetWorkflowAggregates(ctx context.Context, input GetWorkflowAggr
 		for i, g := range groups {
 			groupMap[g.name] = *(groupVals[i].(**string))
 		}
-		row := WorkflowAggregateRow{Group: groupMap}
+		row := WorkflowAggregateRow{Group: groupMap, TotalGroups: totalGroups}
 		for i, sel := range selects {
 			val := *(selectVals[i].(**int64))
 			switch sel.name {
