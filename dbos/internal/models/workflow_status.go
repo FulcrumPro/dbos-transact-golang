@@ -55,18 +55,12 @@ type WorkflowStatus struct {
 	DebounceDeadline   time.Time          `json:"debounce_deadline,omitzero"`    // Absolute cap beyond which debounce calls may not extend the delay (zero = no cap)
 	IsDebounced        bool               `json:"is_debounced,omitempty"`        // Whether the deduplication ID is a debounce key to clear on the DELAYED->ENQUEUED transition
 	ApplicationName    string             `json:"application_name,omitempty"`    // Owning application; empty if unclaimed (any application may run it)
-	RunOnce            bool               `json:"-"`                             // Derived from the RunOnceAttributeKey attribute: the body starts at most once
+	RunOnce            bool               `json:"run_once,omitempty"`            // Whether the workflow carries the run-once marker (stored as the reserved RunOnceAttributeKey attribute, which Attributes omits)
 }
 
 // RunOnceAttributeKey is the reserved workflow attribute that marks a workflow
 // as run-once. DBOS writes it at insert; user attributes may not contain it.
 const RunOnceAttributeKey = "dbos.run_once"
-
-// RunOnceMarked reports whether attributes carry the run-once marker.
-func RunOnceMarked(attributes map[string]any) bool {
-	marked, _ := attributes[RunOnceAttributeKey].(bool)
-	return marked
-}
 
 // MarshalJSON renders Timeout as integer milliseconds (timeout_ms), matching the
 // other DBOS SDKs and the system database, instead of Go's nanosecond Duration.

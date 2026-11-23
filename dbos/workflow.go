@@ -631,11 +631,14 @@ func WithInstance(instance ConfiguredInstance) WorkflowRegistrationOption {
 // that is interrupted is not run again. Use it for a body that cannot replay
 // safely, such as one holding state that lives only in its own execution.
 //
-// A run-once workflow is started only by dequeueing it: enqueue it with
-// WithQueue and WithRunOnceMarker (or WithEnqueueRunOnce from a client).
-//   - The first dequeue runs the body. Any later dequeue of the same workflow
-//     (launch, admin, or Conductor recovery; a retried start) moves it to
-//     CANCELLED without running the body, even while the first run is alive.
+// A run-once workflow is started only by dequeueing it. RunWorkflow with
+// WithQueue marks it run-once automatically; a client enqueueing it by name
+// must pass WithEnqueueRunOnce. The marker is the reserved workflow attribute
+// "dbos.run_once", reported as WorkflowStatus.RunOnce.
+//   - The first dequeue runs the body. Recovery (launch, admin, Conductor)
+//     cancels a run-once workflow whose body already started instead of
+//     re-enqueueing it, even while that body is alive; any later dequeue of
+//     it (a retried start, an external re-enqueue) also cancels it.
 //   - Resuming or forking it fails with ErrRunOnceWorkflow and writes nothing.
 //   - Starting it directly (without a queue) fails with ErrRunOnceWorkflow.
 //   - A row dequeued without the marker (enqueued by an older binary, the SQL
@@ -882,7 +885,6 @@ type workflowOptions struct {
 	QueuePartitionKey   string
 	DelayDuration       time.Duration
 	WorkflowAttributes  map[string]any
-	runOnceMarker       bool
 	alreadyEncodedInput bool
 	isDequeue           bool
 	isPortableWorkflow  bool
@@ -993,15 +995,6 @@ func checkReservedAttributes(attributes map[string]any) error {
 		return models.NewInvalidOptionError(fmt.Sprintf("workflow attribute %q is reserved by DBOS", models.RunOnceAttributeKey))
 	}
 	return nil
-}
-
-// WithRunOnceMarker marks an enqueued workflow as run-once: its body starts at
-// most once (see WithRunOnce). Must be used together with WithQueue. The marker
-// is stored as the reserved workflow attribute "dbos.run_once".
-func WithRunOnceMarker() WorkflowOption {
-	return func(p *workflowOptions) {
-		p.runOnceMarker = true
-	}
 }
 
 // An internal option we use to map the reflection function name to the registration options.
@@ -1270,13 +1263,9 @@ func (c *dbosContext) RunWorkflow(_ Context, fn WorkflowFunc, input any, opts ..
 	}
 
 	// Run-once workflows start only from their queue
-	if params.runOnceMarker && params.queue == nil {
-		c.logger.Error("run-once marker provided but queue name is missing", "workflow_name", params.WorkflowName)
-		return nil, models.NewInvalidOptionError("run-once marker provided but queue name is missing")
-	}
 	if registeredWorkflow.RunOnce && params.queue == nil && !params.isDequeue {
 		c.logger.Error("run-once workflow started without a queue", "workflow_name", params.WorkflowName)
-		return nil, models.NewRunOnceWorkflowError(params.WorkflowID, "it can only be started by enqueueing it with the run-once marker")
+		return nil, models.NewRunOnceWorkflowError(params.WorkflowID, "it can only be started by enqueueing it")
 	}
 
 	// Validate partition key and deduplication ID are not both provided (they are incompatible)
@@ -1493,7 +1482,7 @@ func (c *dbosContext) RunWorkflow(_ Context, fn WorkflowFunc, input any, opts ..
 		QueuePartitionKey:  params.QueuePartitionKey,
 		DelayUntil:         delayUntil,
 		Attributes:         params.WorkflowAttributes,
-		RunOnce:            params.runOnceMarker,
+		RunOnce:            registeredWorkflow.RunOnce && queueName != "", // enqueue writes the marker; a dequeued start never rewrites attributes
 		Serialization: func() string {
 			if params.isPortableWorkflow {
 				return PortableSerializerName

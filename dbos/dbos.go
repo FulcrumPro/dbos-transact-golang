@@ -885,6 +885,10 @@ func (c *dbosContext) Launch() error {
 		return err
 	}
 
+	if len(c.config.ProcessCapExemptQueues) > 0 {
+		c.logExemptQueues()
+	}
+
 	// Recover local pending workflows before starting the queue runner so
 	// recovered workflows are not racing a fresh dequeue pass.
 	recoveryHandles, err := recoverPendingWorkflows(c, []string{c.executorID})
@@ -1226,4 +1230,25 @@ func clearRegistries(ctx Context) {
 		return
 	}
 	c.ClearRegistries()
+}
+
+// logExemptQueues reports the queues exempt from MaxConcurrentWorkflows and
+// warns for names that match no registered queue. Database-backed queues are
+// registered after Launch, so a warning can also mean "not registered yet".
+func (c *dbosContext) logExemptQueues() {
+	c.logger.Info("Queues exempt from the process workflow cap", "queues", c.config.ProcessCapExemptQueues, "max_concurrent_workflows", c.config.MaxConcurrentWorkflows)
+	queues, err := c.systemDB.ListQueues(c, nil)
+	if err != nil {
+		c.logger.Warn("Could not list queues to check the process-cap exempt queues", "error", err)
+		return
+	}
+	registered := make(map[string]bool, len(queues))
+	for _, q := range queues {
+		registered[q.Name] = true
+	}
+	for _, name := range c.config.ProcessCapExemptQueues {
+		if !registered[name] {
+			c.logger.Warn("Process-cap exempt queue is not registered (yet)", "queue", name)
+		}
+	}
 }

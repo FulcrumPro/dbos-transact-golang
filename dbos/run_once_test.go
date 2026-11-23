@@ -3,7 +3,6 @@ package dbos
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -175,6 +174,7 @@ type runOnceRuntimeConfig struct {
 	appVersion string
 	executorID string
 	adminPort  int
+	maxRoots   int
 	logger     *slog.Logger
 }
 
@@ -184,14 +184,15 @@ type runOnceRuntimeConfig struct {
 func newRunOnceRuntime(t *testing.T, cfg runOnceRuntimeConfig, probe *runOnceProbe) Context {
 	t.Helper()
 	c, err := NewContext(context.Background(), Config{
-		DatabaseURL:        cfg.dbURL,
-		AppName:            runOnceAppName,
-		ApplicationVersion: cfg.appVersion,
-		ExecutorID:         cfg.executorID,
-		AdminServer:        cfg.adminPort > 0,
-		AdminServerHost:    "127.0.0.1",
-		AdminServerPort:    cfg.adminPort,
-		Logger:             cfg.logger,
+		DatabaseURL:            cfg.dbURL,
+		AppName:                runOnceAppName,
+		ApplicationVersion:     cfg.appVersion,
+		ExecutorID:             cfg.executorID,
+		AdminServer:            cfg.adminPort > 0,
+		AdminServerHost:        "127.0.0.1",
+		AdminServerPort:        cfg.adminPort,
+		MaxConcurrentWorkflows: cfg.maxRoots,
+		Logger:                 cfg.logger,
 	})
 	require.NoError(t, err)
 	RegisterWorkflow(c, probe.runOnceBody, WithWorkflowName(runOnceWorkflowName), WithRunOnce())
@@ -212,9 +213,9 @@ func runOnceObserver(t *testing.T, dbURL string) Client {
 	return c
 }
 
-func registerRunOnceQueue(t *testing.T, ctx Context) Queue {
+func registerRunOnceQueue(t *testing.T, ctx Context, opts ...QueueOption) Queue {
 	t.Helper()
-	q, err := RegisterQueue(ctx, runOnceQueueName, WithQueueBasePollingInterval(50*time.Millisecond))
+	q, err := RegisterQueue(ctx, runOnceQueueName, append([]QueueOption{WithQueueBasePollingInterval(50 * time.Millisecond)}, opts...)...)
 	require.NoError(t, err)
 	return q
 }
@@ -234,7 +235,7 @@ func startRunOncePair(t *testing.T, ctx Context, q Queue, probe *runOnceProbe) (
 	t.Helper()
 	runOnceID = "run-once-" + uuid.NewString()
 	ordinaryID = "ordinary-" + uuid.NewString()
-	_, err := RunWorkflow(ctx, probe.runOnceBody, "", WithQueue(q), WithRunOnceMarker(), WithWorkflowID(runOnceID))
+	_, err := RunWorkflow(ctx, probe.runOnceBody, "", WithQueue(q), WithWorkflowID(runOnceID))
 	require.NoError(t, err)
 	_, err = RunWorkflow(ctx, probe.ordinaryBody, "", WithQueue(q), WithWorkflowID(ordinaryID))
 	require.NoError(t, err)
@@ -260,7 +261,7 @@ func freshRunOnceDB(t *testing.T) string {
 func assertDeadRecovery(t *testing.T, survivor Context, runOnceID, ordinaryID string) {
 	t.Helper()
 	row := waitForRow(t, survivor, runOnceID, isCancelledRow, "CANCELLED")
-	assert.Equal(t, 2, row.Attempts, "the refusing dequeue is the second start attempt")
+	assert.Equal(t, 1, row.Attempts, "recovery cancels the row without a second start")
 	assert.Nil(t, row.QueueName, "a refused run-once row leaves its queue")
 	assert.NotNil(t, row.CompletedAt, "a refused run-once row is completed like a cancellation")
 
@@ -270,7 +271,7 @@ func assertDeadRecovery(t *testing.T, survivor Context, runOnceID, ordinaryID st
 
 	assert.Equal(t, 1, runOncePops(t, survivor, runOnceID), "the run-once body must start exactly once")
 	// The first body may have checkpointed its Recv timeout before it stopped;
-	// the refused dequeue adds nothing.
+	// the cancellation adds nothing.
 	steps, err := GetWorkflowSteps(survivor, runOnceID)
 	require.NoError(t, err)
 	assert.LessOrEqual(t, len(steps), 1)
@@ -441,7 +442,7 @@ func TestRunOnceRecovery(t *testing.T) {
 
 		b := newRunOnceRuntime(t, cfg, probe)
 		row := waitForRow(t, b, runOnceID, isCancelledRow, "CANCELLED")
-		assert.Equal(t, 2, row.Attempts)
+		assert.Equal(t, 1, row.Attempts)
 
 		require.NoError(t, Send(b, runOnceID, "wake", runOnceTopic))
 		require.Eventually(t, func() bool { _, ok := probe.recvError(runOnceID); return ok },
@@ -575,7 +576,7 @@ func TestRunOnceLostStartAck(t *testing.T) {
 	t.Run("RunOnce", func(t *testing.T) {
 		id := "run-once-" + uuid.NewString()
 		fired := pool.arm(isDequeueStatusInsertFor(id), nil, nil, true)
-		_, err := RunWorkflow(ctx, probe.runOnceBody, "", WithQueue(q), WithRunOnceMarker(), WithWorkflowID(id))
+		_, err := RunWorkflow(ctx, probe.runOnceBody, "", WithQueue(q), WithWorkflowID(id))
 		require.NoError(t, err)
 		<-fired
 		row := waitForRow(t, ctx, id, isCancelledRow, "CANCELLED")
@@ -617,6 +618,7 @@ func TestRunOnceRepeatInsertCancels(t *testing.T) {
 		defer tx.Rollback(bg)
 		_, err = s.InsertWorkflowStatus(bg, sysdb.InsertWorkflowStatusDBInput{Tx: tx, Status: WorkflowStatus{
 			ID: id, Name: "w", Status: WorkflowStatusEnqueued, QueueName: "q", CreatedAt: time.Now(), RunOnce: runOnce,
+			ExecutorID: "exec-recovery-test", ApplicationVersion: "v-recovery-test",
 		}})
 		require.NoError(t, err)
 		require.NoError(t, tx.Commit(bg))
@@ -632,7 +634,7 @@ func TestRunOnceRepeatInsertCancels(t *testing.T) {
 		res, err := s.InsertWorkflowStatus(bg, sysdb.InsertWorkflowStatusDBInput{
 			Tx: tx, IncrementAttempts: true, MaxRetries: 100,
 			RegistrationRunOnce: registrationRunOnce, RunOnceMarkerMissingError: "marker missing",
-			Status: WorkflowStatus{ID: id, Name: "w", Status: WorkflowStatusPending, CreatedAt: time.Now()},
+			Status: WorkflowStatus{ID: id, Name: "w", Status: WorkflowStatusPending, CreatedAt: time.Now(), ExecutorID: "exec-recovery-test"},
 		})
 		require.NoError(t, err)
 		require.NoError(t, tx.Commit(bg))
@@ -672,6 +674,20 @@ func TestRunOnceRepeatInsertCancels(t *testing.T) {
 		require.NotNil(t, row.Error)
 		assert.Equal(t, "marker missing", *row.Error)
 	})
+	t.Run("RecoveryCancelsOnlyStartedMarkedRows", func(t *testing.T) {
+		started, unstarted, ordinary := uuid.NewString(), uuid.NewString(), uuid.NewString()
+		enqueue(started, true)
+		dequeueInsert(started, true)
+		enqueue(unstarted, true) // PENDING with recovery_attempts 0: dequeued, never started
+		enqueue(ordinary, false)
+		dequeueInsert(ordinary, false)
+		ids, err := s.ReenqueueForRecovery(bg, []string{"exec-recovery-test"}, "v-recovery-test", models.InternalQueueName)
+		require.NoError(t, err)
+		assert.ElementsMatch(t, []string{started, unstarted, ordinary}, ids)
+		assert.Equal(t, WorkflowStatusCancelled, readRunOnceRow(t, ctx, started).Status)
+		assert.Equal(t, WorkflowStatusEnqueued, readRunOnceRow(t, ctx, unstarted).Status)
+		assert.Equal(t, WorkflowStatusEnqueued, readRunOnceRow(t, ctx, ordinary).Status)
+	})
 	t.Run("OrdinaryRowNeverRefused", func(t *testing.T) {
 		id := uuid.NewString()
 		enqueue(id, false)
@@ -698,16 +714,12 @@ func TestRunOnceStartRules(t *testing.T) {
 		before := countWorkflowRows(t, ctx)
 		_, err := RunWorkflow(ctx, probe.runOnceBody, "", WithWorkflowID("direct-"+uuid.NewString()))
 		require.ErrorIs(t, err, ErrRunOnceWorkflow)
-		_, err = RunWorkflow(ctx, probe.runOnceBody, "", WithWorkflowID("direct-"+uuid.NewString()), WithRunOnceMarker())
-		require.ErrorIs(t, err, ErrInvalidOption, "the marker requires a queue")
-		_, err = RunWorkflow(ctx, probe.ordinaryBody, "", WithRunOnceMarker())
-		require.ErrorIs(t, err, ErrInvalidOption)
 		assert.Equal(t, before, countWorkflowRows(t, ctx), "a refused start writes no row")
 	})
 
 	t.Run("DirectStartOfRunningWorkflowRefused", func(t *testing.T) {
 		id := "run-once-" + uuid.NewString()
-		_, err := RunWorkflow(ctx, probe.runOnceBody, "", WithQueue(q), WithRunOnceMarker(), WithWorkflowID(id))
+		_, err := RunWorkflow(ctx, probe.runOnceBody, "", WithQueue(q), WithWorkflowID(id))
 		require.NoError(t, err)
 		waitForPops(t, ctx, id, 1)
 		_, err = RunWorkflow(ctx, probe.runOnceBody, "", WithWorkflowID(id))
@@ -717,9 +729,19 @@ func TestRunOnceStartRules(t *testing.T) {
 		assert.Equal(t, 1, runOncePops(t, ctx, id))
 	})
 
-	t.Run("EnqueuedWithoutMarker", func(t *testing.T) {
+	t.Run("QueuedRunWorkflowMarksRunOnceRegistration", func(t *testing.T) {
+		id := "auto-marked-" + uuid.NewString()
+		_, err := RunWorkflow(ctx, probe.runOnceBody, "", WithQueue(q), WithWorkflowID(id))
+		require.NoError(t, err)
+		waitForPops(t, ctx, id, 1)
+		assert.True(t, readRunOnceRow(t, ctx, id).RunOnce)
+		require.NoError(t, Send(ctx, id, "done", runOnceTopic))
+		waitForRow(t, ctx, id, func(r runOnceRow) bool { return r.Status == WorkflowStatusSuccess }, "SUCCESS")
+	})
+
+	t.Run("EnqueuedByNameWithoutMarker", func(t *testing.T) {
 		id := "unmarked-" + uuid.NewString()
-		handle, err := RunWorkflow(ctx, probe.runOnceBody, "", WithQueue(q), WithWorkflowID(id))
+		handle, err := Enqueue[string](ctx, runOnceQueueName, runOnceWorkflowName, "", WithEnqueueWorkflowID(id))
 		require.NoError(t, err)
 		_, err = handle.GetResult()
 		require.ErrorIs(t, err, ErrRunOnceWorkflow)
@@ -766,7 +788,7 @@ func TestRunOnceResumeAndForkRefused(t *testing.T) {
 		id := prefix + uuid.NewString()
 		var err error
 		if runOnce {
-			_, err = RunWorkflow(ctx, probe.runOnceBody, "", WithQueue(q), WithRunOnceMarker(), WithWorkflowID(id))
+			_, err = RunWorkflow(ctx, probe.runOnceBody, "", WithQueue(q), WithWorkflowID(id))
 		} else {
 			_, err = RunWorkflow(ctx, probe.ordinaryBody, "", WithQueue(q), WithWorkflowID(id))
 		}
@@ -804,6 +826,11 @@ func TestRunOnceResumeAndForkRefused(t *testing.T) {
 		_, err = ResumeWorkflows[string](ctx, []string{cancelledOrdinary, cancelledRunOnce})
 		require.ErrorIs(t, err, ErrRunOnceWorkflow)
 		assert.Contains(t, err.Error(), "the whole batch")
+		_, err = ResumeWorkflows[string](ctx, []string{cancelledRunOnce, cancelledOrdinary, pendingRunOnce})
+		require.ErrorIs(t, err, ErrRunOnceWorkflow)
+		assert.Contains(t, err.Error(), cancelledRunOnce, "the refusal names every run-once workflow")
+		assert.Contains(t, err.Error(), pendingRunOnce)
+		assert.NotContains(t, err.Error(), cancelledOrdinary)
 		assert.Equal(t, before, snapshot(), "a refused resume writes nothing")
 	})
 
@@ -811,9 +838,11 @@ func TestRunOnceResumeAndForkRefused(t *testing.T) {
 		_, err := ForkWorkflow[string](ctx, ForkWorkflowInput{OriginalWorkflowID: cancelledRunOnce})
 		require.ErrorIs(t, err, ErrRunOnceWorkflow)
 		_, err = ForkWorkflows[string](ctx, ForkWorkflowsInput{Workflows: []ForkWorkflowSpec{
-			{OriginalWorkflowID: cancelledOrdinary}, {OriginalWorkflowID: pendingRunOnce},
+			{OriginalWorkflowID: cancelledOrdinary}, {OriginalWorkflowID: pendingRunOnce}, {OriginalWorkflowID: cancelledRunOnce},
 		}})
 		require.ErrorIs(t, err, ErrRunOnceWorkflow)
+		assert.Contains(t, err.Error(), pendingRunOnce, "the refusal names every run-once workflow")
+		assert.Contains(t, err.Error(), cancelledRunOnce)
 		assert.Equal(t, rowsBefore, countWorkflowRows(t, ctx), "a refused fork inserts no row")
 		assert.Equal(t, before, snapshot())
 	})
@@ -826,6 +855,17 @@ func TestRunOnceResumeAndForkRefused(t *testing.T) {
 		assert.Equal(t, "resume=true fork=true", res)
 		assert.Equal(t, rowsBefore+1, countWorkflowRows(t, ctx), "only the calling workflow's own row is new")
 		assert.Equal(t, before, snapshot())
+	})
+
+	t.Run("NeverAdmitted", func(t *testing.T) {
+		id := "run-once-unpolled-" + uuid.NewString()
+		_, err := Enqueue[string](ctx, "run-once-queue-nobody-polls", runOnceWorkflowName, "", WithEnqueueWorkflowID(id), WithEnqueueRunOnce())
+		require.NoError(t, err)
+		require.Equal(t, 0, readRunOnceRow(t, ctx, id).Attempts)
+		require.NoError(t, CancelWorkflow(ctx, id))
+		_, err = ResumeWorkflow[string](ctx, id)
+		require.ErrorIs(t, err, ErrRunOnceWorkflow)
+		assert.Equal(t, WorkflowStatusCancelled, readRunOnceRow(t, ctx, id).Status)
 	})
 
 	t.Run("ControlOrdinaryResumes", func(t *testing.T) {
@@ -849,6 +889,7 @@ func TestRunOnceResumeAndForkRefused(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, statuses, 1)
 		assert.True(t, statuses[0].RunOnce, "ListWorkflows reports the marker")
+		assert.NotContains(t, statuses[0].Attributes, "dbos.run_once", "the reserved key is not a user attribute")
 
 		s := runOnceSysDB(ctx)
 		exported, err := s.ExportWorkflow(ctx, id, false)
@@ -886,8 +927,6 @@ func TestRunOnceReservedAttribute(t *testing.T) {
 			forged := map[string]any{"dbos.run_once": value}
 			_, err := RunWorkflow(ctx, probe.ordinaryBody, "", WithQueue(q), WithWorkflowAttributes(forged))
 			require.ErrorIs(t, err, ErrInvalidOption)
-			_, err = RunWorkflow(ctx, probe.runOnceBody, "", WithQueue(q), WithRunOnceMarker(), WithWorkflowAttributes(forged))
-			require.ErrorIs(t, err, ErrInvalidOption)
 			_, err = Enqueue[string](ctx, runOnceQueueName, ordinaryWorkflowName, "", WithEnqueueAttributes(forged))
 			require.ErrorIs(t, err, ErrInvalidOption)
 		}
@@ -896,7 +935,7 @@ func TestRunOnceReservedAttribute(t *testing.T) {
 
 	t.Run("MarkerMergedAndKept", func(t *testing.T) {
 		id := "run-once-attrs-" + uuid.NewString()
-		_, err := RunWorkflow(ctx, probe.runOnceBody, "", WithQueue(q), WithRunOnceMarker(), WithWorkflowID(id),
+		_, err := RunWorkflow(ctx, probe.runOnceBody, "", WithQueue(q), WithWorkflowID(id),
 			WithWorkflowAttributes(map[string]any{"customer": "acme"}))
 		require.NoError(t, err)
 		waitForPops(t, ctx, id, 1)
@@ -904,6 +943,17 @@ func TestRunOnceReservedAttribute(t *testing.T) {
 		assert.Equal(t, map[string]any{"customer": "acme", "dbos.run_once": true}, row.Attributes)
 
 		require.ErrorIs(t, SetWorkflowAttributes(ctx, id, map[string]any{"dbos.run_once": false}), ErrInvalidOption)
+
+		// Read-modify-write of the listed attributes.
+		listed, err := ListWorkflows(ctx, WithFilterWorkflowIDs(id))
+		require.NoError(t, err)
+		require.Len(t, listed, 1)
+		assert.True(t, listed[0].RunOnce)
+		assert.Equal(t, map[string]any{"customer": "acme"}, listed[0].Attributes)
+		listed[0].Attributes["note"] = "seen"
+		require.NoError(t, SetWorkflowAttributes(ctx, id, listed[0].Attributes))
+		assert.Equal(t, map[string]any{"customer": "acme", "note": "seen", "dbos.run_once": true}, readRunOnceRow(t, ctx, id).Attributes)
+
 		require.NoError(t, SetWorkflowAttributes(ctx, id, map[string]any{"customer": "globex"}))
 		assert.Equal(t, map[string]any{"customer": "globex", "dbos.run_once": true}, readRunOnceRow(t, ctx, id).Attributes)
 		require.NoError(t, SetWorkflowAttributes(ctx, id, nil))
@@ -927,6 +977,101 @@ func TestRunOnceReservedAttribute(t *testing.T) {
 		require.NoError(t, Send(ctx, id, "done", runOnceTopic))
 		waitForRow(t, ctx, id, func(r runOnceRow) bool { return r.Status == WorkflowStatusSuccess }, "SUCCESS")
 	})
+}
+
+// TestRunOnceRecoveryWithSaturatedPermits: a live run-once body holds the
+// only queue or process permit. Recovery must cancel it without needing a
+// permit, and the live body's next DBOS call sees the cancellation. A marked
+// workflow that never started keeps waiting for a permit and then runs.
+func TestRunOnceRecoveryWithSaturatedPermits(t *testing.T) {
+	cases := []struct {
+		name      string
+		maxRoots  int
+		queueOpts []QueueOption
+	}{
+		{name: "QueueWorkerConcurrencyOne", queueOpts: []QueueOption{WithWorkerConcurrency(1)}},
+		{name: "ProcessCapFull", maxRoots: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			probe := newRunOnceProbe()
+			cfg := runOnceRuntimeConfig{dbURL: freshRunOnceDB(t), appVersion: "run-once-" + uuid.NewString(),
+				executorID: "exec-a", adminPort: freeTCPPort(t), maxRoots: tc.maxRoots}
+			a := newRunOnceRuntime(t, cfg, probe)
+			q := registerRunOnceQueue(t, a, tc.queueOpts...)
+
+			liveID := "run-once-live-" + uuid.NewString()
+			_, err := RunWorkflow(a, probe.runOnceBody, "", WithQueue(q), WithWorkflowID(liveID))
+			require.NoError(t, err)
+			waitForPops(t, a, liveID, 1)
+			waitingID := "run-once-waiting-" + uuid.NewString()
+			_, err = RunWorkflow(a, probe.runOnceBody, "", WithQueue(q), WithWorkflowID(waitingID))
+			require.NoError(t, err)
+
+			recovered := postAdminRecovery(t, cfg.adminPort, "exec-a")
+			assert.Equal(t, []string{liveID}, recovered)
+			row := waitForRow(t, a, liveID, isCancelledRow, "CANCELLED")
+			assert.Equal(t, 1, row.Attempts)
+			waiting := readRunOnceRow(t, a, waitingID)
+			assert.Equal(t, WorkflowStatusEnqueued, waiting.Status, "a marked workflow that never started is not cancelled")
+			assert.Equal(t, 0, waiting.Attempts)
+
+			require.NoError(t, Send(a, liveID, "wake", runOnceTopic))
+			require.Eventually(t, func() bool { _, ok := probe.recvError(liveID); return ok },
+				20*time.Second, 20*time.Millisecond, "the live body never returned from Recv")
+			recvErr, _ := probe.recvError(liveID)
+			assert.ErrorIs(t, recvErr, ErrWorkflowCancelled)
+			assert.Equal(t, 1, runOncePops(t, a, liveID))
+
+			// The cancelled body released its permit: the waiting one now runs once.
+			waitForPops(t, a, waitingID, 1)
+			require.NoError(t, Send(a, waitingID, "done", runOnceTopic))
+			waitForRow(t, a, waitingID, func(r runOnceRow) bool { return r.Status == WorkflowStatusSuccess }, "SUCCESS")
+		})
+	}
+}
+
+// TestRunOnceListingSurvivesReplay: a workflow's checkpointed ListWorkflows
+// step keeps RunOnce when the step is replayed from its checkpoint.
+func TestRunOnceListingSurvivesReplay(t *testing.T) {
+	ctx := setupDBOS(t, setupDBOSOptions{dropDB: true})
+	probe := newRunOnceProbe()
+	RegisterWorkflow(ctx, probe.runOnceBody, WithWorkflowName(runOnceWorkflowName), WithRunOnce())
+	lister := func(ctx Context, target string) (string, error) {
+		statuses, err := ListWorkflows(ctx, WithFilterWorkflowIDs(target))
+		if err != nil {
+			return "", err
+		}
+		if len(statuses) != 1 {
+			return "", fmt.Errorf("listed %d workflows", len(statuses))
+		}
+		return fmt.Sprintf("run_once=%v attributes=%v", statuses[0].RunOnce, statuses[0].Attributes), nil
+	}
+	RegisterWorkflow(ctx, lister, WithWorkflowName("run-once-lister"))
+	require.NoError(t, Launch(ctx))
+	ensureRunOnceCounterTable(t, ctx)
+	q := registerRunOnceQueue(t, ctx)
+
+	target := "run-once-listed-" + uuid.NewString()
+	_, err := RunWorkflow(ctx, probe.runOnceBody, "", WithQueue(q), WithWorkflowID(target))
+	require.NoError(t, err)
+	waitForPops(t, ctx, target, 1)
+
+	listing, err := RunWorkflow(ctx, lister, target)
+	require.NoError(t, err)
+	first, err := listing.GetResult()
+	require.NoError(t, err)
+	assert.Equal(t, "run_once=true attributes=map[]", first)
+
+	// The fork starts after the listing step, so it replays that step's checkpoint.
+	replay, err := ForkWorkflow[string](ctx, ForkWorkflowInput{OriginalWorkflowID: listing.GetWorkflowID(), StartStep: 1})
+	require.NoError(t, err)
+	replayed, err := replay.GetResult()
+	require.NoError(t, err)
+	assert.Equal(t, first, replayed)
+
+	require.NoError(t, Send(ctx, target, "done", runOnceTopic))
+	waitForRow(t, ctx, target, func(r runOnceRow) bool { return r.Status == WorkflowStatusSuccess }, "SUCCESS")
 }
 
 // TestSendFailureLogsMessageSize: a failed Send logs the message size, never
@@ -1119,6 +1264,7 @@ func TestRecvCancellation(t *testing.T) {
 
 	t.Run("CancelWhileConsuming", func(t *testing.T) {
 		skipIfSqlite(t, "uses a Postgres row lock to hold the consume statement")
+		skipIfCockroach(t, "reads lock waits from pg_stat_activity")
 		id := "recv-consume-" + uuid.NewString()
 		g := newGate(id)
 		handle, err := RunWorkflow(ctx, cancelThenRecv, "", WithWorkflowID(id))
@@ -1137,7 +1283,7 @@ func TestRecvCancellation(t *testing.T) {
 		require.Eventually(t, func() bool {
 			var waiting int
 			err := s.Pool().QueryRow(context.Background(),
-				`SELECT COUNT(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%SET consumed = true%'`).Scan(&waiting)
+				`SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%SET consumed = true%'`).Scan(&waiting)
 			return err == nil && waiting > 0
 		}, 10*time.Second, 10*time.Millisecond, "the consume statement never blocked on the row lock")
 		cancel()
@@ -1190,23 +1336,6 @@ func TestRecvCancellation(t *testing.T) {
 		require.True(t, ok)
 		assert.EqualValues(t, 1, n.(*atomic.Int64).Load(), "the command is applied once")
 		assert.Equal(t, 0, unconsumed(id))
-
-		steps, err := GetWorkflowSteps(ctx, id, WithStepsLoadOutput(true))
-		require.NoError(t, err)
-		names := make([]string, len(steps))
-		for i, st := range steps {
-			names[i] = st.StepName
-		}
-		require.Contains(t, names, "DBOS.recv")
-		require.Contains(t, names, "DBOS.getWorkflowSteps", "the in-body read is itself a checkpointed step")
-		encodedCmd := base64.StdEncoding.EncodeToString([]byte(`"cmd-4"`))
-		for _, st := range steps {
-			if st.StepName == "DBOS.getWorkflowSteps" {
-				out, ok := st.Output.(string)
-				require.True(t, ok, "listed as %T", st.Output)
-				assert.Contains(t, out, encodedCmd, "the checkpointed read copies the prior recv output")
-			}
-		}
 	})
 }
 

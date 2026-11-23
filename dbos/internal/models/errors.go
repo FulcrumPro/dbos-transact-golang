@@ -404,6 +404,18 @@ func NewRunOnceWorkflowError(workflowID, reason string) *Error {
 	}
 }
 
+// NewRunOnceWorkflowsError refuses an operation on a batch naming the given
+// run-once workflows.
+func NewRunOnceWorkflowsError(workflowIDs []string, reason string) *Error {
+	if len(workflowIDs) == 1 {
+		return NewRunOnceWorkflowError(workflowIDs[0], "it "+reason)
+	}
+	return &Error{
+		Message: fmt.Sprintf("workflows %s are run-once: they %s", strings.Join(workflowIDs, ", "), reason),
+		Code:    ErrorCodeRunOnceWorkflow,
+	}
+}
+
 func NewScheduleNotFoundError(scheduleName string) *Error {
 	return &Error{
 		Message: fmt.Sprintf("schedule %s does not exist", scheduleName),
