@@ -89,6 +89,7 @@ const (
 	ErrorCodeQueueNotFound            = models.ErrorCodeQueueNotFound            // Referenced queue does not exist
 	ErrorCodeScheduleNotFound         = models.ErrorCodeScheduleNotFound         // Referenced schedule does not exist
 	ErrorCodeInvalidOption            = models.ErrorCodeInvalidOption            // Invalid or inconsistent options passed to a DBOS API
+	ErrorCodeRunOnceWorkflow          = models.ErrorCodeRunOnceWorkflow          // Operation refused because it would run a run-once workflow's body again
 )
 
 // Driver-facing SQL surface: custom database drivers implement Pool and

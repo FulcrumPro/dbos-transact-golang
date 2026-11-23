@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -69,6 +70,7 @@ type Config struct {
 	SystemDBStartupTimeout       time.Duration         // Maximum time for system-database connection and migrations (defaults to 2 minutes)
 	NotificationCoalesceInterval time.Duration         // Controls how often stream-write and set-event notifications are batched
 	MaxConcurrentWorkflows       int                   // Maximum root workflow functions running in this runtime; zero means unlimited
+	ProcessCapExemptQueues       []string              // Queues whose roots do not count toward MaxConcurrentWorkflows; each queue's WorkerConcurrency still applies. Process-local: not persisted, so every runtime sets its own list.
 	namelessOwner                bool                  // Act for no specific application: write unclaimed rows, matches all. Used by clients without an AppName.
 	isClient                     bool                  // Client handle: runs no workflows, so enqueues leave the version unset by default.
 }
@@ -86,6 +88,9 @@ func processConfig(inputConfig *Config) (*Config, error) {
 	}
 	if inputConfig.MaxConcurrentWorkflows < 0 {
 		return nil, fmt.Errorf("maxConcurrentWorkflows cannot be negative")
+	}
+	if slices.Contains(inputConfig.ProcessCapExemptQueues, "") {
+		return nil, fmt.Errorf("processCapExemptQueues cannot contain an empty queue name")
 	}
 	if inputConfig.SystemDBPool == nil && inputConfig.SQLiteSystemDB == nil {
 		if _, err := sysdb.DetectDialect(inputConfig.DatabaseURL); err != nil {
@@ -124,6 +129,7 @@ func processConfig(inputConfig *Config) (*Config, error) {
 		SystemDBStartupTimeout:       inputConfig.SystemDBStartupTimeout,
 		NotificationCoalesceInterval: inputConfig.NotificationCoalesceInterval,
 		MaxConcurrentWorkflows:       inputConfig.MaxConcurrentWorkflows,
+		ProcessCapExemptQueues:       slices.Clone(inputConfig.ProcessCapExemptQueues),
 		namelessOwner:                inputConfig.namelessOwner,
 		isClient:                     inputConfig.isClient,
 	}
@@ -635,7 +641,7 @@ func NewContext(ctx context.Context, inputConfig Config) (Context, error) {
 		return nil, models.NewInitializationError(err.Error())
 	}
 	initExecutor.config = config
-	initExecutor.admission = newWorkflowAdmission(config.MaxConcurrentWorkflows)
+	initExecutor.admission = newWorkflowAdmission(config.MaxConcurrentWorkflows, config.ProcessCapExemptQueues)
 
 	// Set global logger
 	initExecutor.logger = config.Logger
@@ -877,6 +883,10 @@ func (c *dbosContext) Launch() error {
 	}
 	if err := c.checkLaunchContext(); err != nil {
 		return err
+	}
+
+	if len(c.config.ProcessCapExemptQueues) > 0 {
+		c.logExemptQueues()
 	}
 
 	// Recover local pending workflows before starting the queue runner so
@@ -1220,4 +1230,25 @@ func clearRegistries(ctx Context) {
 		return
 	}
 	c.ClearRegistries()
+}
+
+// logExemptQueues reports the queues exempt from MaxConcurrentWorkflows and
+// warns for names that match no registered queue. Database-backed queues are
+// registered after Launch, so a warning can also mean "not registered yet".
+func (c *dbosContext) logExemptQueues() {
+	c.logger.Info("Queues exempt from the process workflow cap", "queues", c.config.ProcessCapExemptQueues, "max_concurrent_workflows", c.config.MaxConcurrentWorkflows)
+	queues, err := c.systemDB.ListQueues(c, nil)
+	if err != nil {
+		c.logger.Warn("Could not list queues to check the process-cap exempt queues", "error", err)
+		return
+	}
+	registered := make(map[string]bool, len(queues))
+	for _, q := range queues {
+		registered[q.Name] = true
+	}
+	for _, name := range c.config.ProcessCapExemptQueues {
+		if !registered[name] {
+			c.logger.Warn("Process-cap exempt queue is not registered (yet)", "queue", name)
+		}
+	}
 }

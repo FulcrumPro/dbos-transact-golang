@@ -516,6 +516,7 @@ type WorkflowRegistryEntry struct {
 	FQN             string // Fully qualified name of the workflow function. For configured instances, qualified with the config name.
 	ClassName       string // Receiver type name for configured instance workflows
 	ConfigName      string // Config name for configured instance workflows
+	RunOnce         bool   // Registered with WithRunOnce: the body starts at most once, from its queue
 }
 
 func registerWorkflow(ctx Context, entry WorkflowRegistryEntry) {
@@ -579,6 +580,7 @@ type workflowRegistrationOptions struct {
 	maxRetries int
 	name       string
 	instance   ConfiguredInstance
+	runOnce    bool
 }
 
 type WorkflowRegistrationOption func(*workflowRegistrationOptions)
@@ -622,6 +624,28 @@ func WithWorkflowName(name string) WorkflowRegistrationOption {
 func WithInstance(instance ConfiguredInstance) WorkflowRegistrationOption {
 	return func(p *workflowRegistrationOptions) {
 		p.instance = instance
+	}
+}
+
+// WithRunOnce registers a workflow whose body must start at most once: a body
+// that is interrupted is not run again. Use it for a body that cannot replay
+// safely, such as one holding state that lives only in its own execution.
+//
+// A run-once workflow is started only by dequeueing it. RunWorkflow with
+// WithQueue marks it run-once automatically; a client enqueueing it by name
+// must pass WithEnqueueRunOnce. The marker is the reserved workflow attribute
+// "dbos.run_once", reported as WorkflowStatus.RunOnce.
+//   - The first dequeue runs the body. Recovery (launch, admin, Conductor)
+//     cancels a run-once workflow whose body already started instead of
+//     re-enqueueing it, even while that body is alive; any later dequeue of
+//     it (a retried start, an external re-enqueue) also cancels it.
+//   - Resuming or forking it fails with ErrRunOnceWorkflow and writes nothing.
+//   - Starting it directly (without a queue) fails with ErrRunOnceWorkflow.
+//   - A row dequeued without the marker (enqueued by an older binary, the SQL
+//     enqueue function, an import, or a schedule) ends in ERROR unrun.
+func WithRunOnce() WorkflowRegistrationOption {
+	return func(p *workflowRegistrationOptions) {
+		p.runOnce = true
 	}
 }
 
@@ -774,6 +798,7 @@ func RegisterWorkflow[P any, R any](ctx Context, fn Workflow[P, R], opts ...Work
 		Name:            registrationParams.name,
 		ClassName:       className,
 		ConfigName:      configName,
+		RunOnce:         registrationParams.runOnce,
 	})
 
 }
@@ -846,26 +871,26 @@ const (
 )
 
 type workflowOptions struct {
-	WorkflowName         string
-	WorkflowID           string
-	queue                Queue
-	ApplicationVersion   string
-	MaxRetries           int
-	DeduplicationID      string
-	DeduplicationPolicy  DeduplicationPolicy
-	Priority             uint
-	AuthenticatedUser    string
-	AssumedRole          string
-	AuthenticatedRoles   []string
-	QueuePartitionKey    string
-	DelayDuration        time.Duration
-	WorkflowAttributes   map[string]any
-	alreadyEncodedInput  bool
-	isDequeue            bool
-	isPortableWorkflow   bool
-	runInstance          ConfiguredInstance
-	admissionToken       *workflowAdmissionToken
-	err                  error // invalid option usage, surfaced when options are parsed
+	WorkflowName        string
+	WorkflowID          string
+	queue               Queue
+	ApplicationVersion  string
+	MaxRetries          int
+	DeduplicationID     string
+	DeduplicationPolicy DeduplicationPolicy
+	Priority            uint
+	AuthenticatedUser   string
+	AssumedRole         string
+	AuthenticatedRoles  []string
+	QueuePartitionKey   string
+	DelayDuration       time.Duration
+	WorkflowAttributes  map[string]any
+	alreadyEncodedInput bool
+	isDequeue           bool
+	isPortableWorkflow  bool
+	runInstance         ConfiguredInstance
+	admissionToken      *workflowAdmissionToken
+	err                 error // invalid option usage, surfaced when options are parsed
 }
 
 // WorkflowOption is a functional option for configuring workflow execution parameters.
@@ -961,6 +986,15 @@ func WithDelay(delay time.Duration) WorkflowOption {
 	return func(p *workflowOptions) {
 		p.DelayDuration = delay
 	}
+}
+
+// checkReservedAttributes refuses user attributes that would forge or clear the
+// run-once marker.
+func checkReservedAttributes(attributes map[string]any) error {
+	if _, ok := attributes[models.RunOnceAttributeKey]; ok {
+		return models.NewInvalidOptionError(fmt.Sprintf("workflow attribute %q is reserved by DBOS", models.RunOnceAttributeKey))
+	}
+	return nil
 }
 
 // An internal option we use to map the reflection function name to the registration options.
@@ -1224,6 +1258,16 @@ func (c *dbosContext) RunWorkflow(_ Context, fn WorkflowFunc, input any, opts ..
 		return nil, models.NewInvalidOptionError("priority provided but queue name is missing")
 	}
 
+	if err := checkReservedAttributes(params.WorkflowAttributes); err != nil {
+		return nil, err
+	}
+
+	// Run-once workflows start only from their queue
+	if registeredWorkflow.RunOnce && params.queue == nil && !params.isDequeue {
+		c.logger.Error("run-once workflow started without a queue", "workflow_name", params.WorkflowName)
+		return nil, models.NewRunOnceWorkflowError(params.WorkflowID, "it can only be started by enqueueing it")
+	}
+
 	// Validate partition key and deduplication ID are not both provided (they are incompatible)
 	if len(params.QueuePartitionKey) > 0 && len(params.DeduplicationID) > 0 {
 		c.logger.Error("partition key and deduplication ID cannot be used together", "workflow_name", params.WorkflowName)
@@ -1438,6 +1482,7 @@ func (c *dbosContext) RunWorkflow(_ Context, fn WorkflowFunc, input any, opts ..
 		QueuePartitionKey:  params.QueuePartitionKey,
 		DelayUntil:         delayUntil,
 		Attributes:         params.WorkflowAttributes,
+		RunOnce:            registeredWorkflow.RunOnce && queueName != "", // enqueue writes the marker; a dequeued start never rewrites attributes
 		Serialization: func() string {
 			if params.isPortableWorkflow {
 				return PortableSerializerName
@@ -1469,6 +1514,12 @@ func (c *dbosContext) RunWorkflow(_ Context, fn WorkflowFunc, input any, opts ..
 			Tx:                tx,
 			OwnerXID:          &ownerXID,
 			IncrementAttempts: params.isDequeue,
+		}
+		if params.isDequeue && registeredWorkflow.RunOnce {
+			insertInput.RegistrationRunOnce = true
+			insertInput.RunOnceMarkerMissingError = serializeWorkflowError(c.logger,
+				models.NewRunOnceWorkflowError(workflowID, "run-once workflow enqueued without the run-once marker"),
+				workflowStatus.Serialization)
 		}
 		insertStatusResult, err = c.systemDB.InsertWorkflowStatus(uncancellableCtx, insertInput)
 		if err != nil {
@@ -1508,8 +1559,12 @@ func (c *dbosContext) RunWorkflow(_ Context, fn WorkflowFunc, input any, opts ..
 				insertStatusResult.Status == WorkflowStatusSuccess || // workflow is in a terminal state (success) OR
 				insertStatusResult.Status == WorkflowStatusError || // workflow is in a terminal state (error) OR
 				(!params.isDequeue && insertStatusResult.OwnerXID != ownerXID) || // another executor, not us dequeueing, is already owning the workflow OR
+				insertStatusResult.RunOnceRefused || // a run-once workflow already started once (or lacks its marker) OR
 				loaded // this executor is already running the workflow
 
+		if insertStatusResult.RunOnceRefused {
+			c.logger.Warn("run-once workflow not started", "workflow_id", workflowID, "status", insertStatusResult.Status, "attempts", insertStatusResult.Attempts, "marked", insertStatusResult.RunOnce)
+		}
 		if shouldSkip {
 			// Commit the transaction to update the number of attempts and/or enact the enqueue
 			if err := tx.Commit(uncancellableCtx); err != nil {
@@ -1949,7 +2004,16 @@ func WithEnqueueAttributes(attributes map[string]any) EnqueueOption {
 	}
 }
 
+// WithEnqueueRunOnce marks the enqueued workflow as run-once: its body starts at
+// most once (see WithRunOnce).
+func WithEnqueueRunOnce() EnqueueOption {
+	return func(opts *enqueueOptions) {
+		opts.runOnce = true
+	}
+}
+
 type enqueueOptions struct {
+	runOnce             bool
 	workflowName        string
 	workflowID          string
 	applicationVersion  string
@@ -2005,6 +2069,10 @@ func (c *dbosContext) Enqueue(_ Client, queueName, workflowName string, input an
 
 	if len(workflowName) == 0 {
 		return nil, models.NewInvalidOptionError("workflow name is required")
+	}
+
+	if err := checkReservedAttributes(params.attributes); err != nil {
+		return nil, err
 	}
 
 	// Validate partition key and deduplication ID are not both provided (they are incompatible)
@@ -2104,6 +2172,7 @@ func (c *dbosContext) Enqueue(_ Client, queueName, workflowName string, input an
 		Attributes:         params.attributes,
 		DebounceDeadline:   params.debounceDeadline,
 		IsDebounced:        params.isDebounced,
+		RunOnce:            params.runOnce,
 	}
 	if isWithinWorkflow {
 		status.ParentWorkflowID = wfState.workflowID
@@ -4561,6 +4630,9 @@ func CancelWorkflow(ctx Client, workflowID string, opts ...CancelWorkflowOption)
 }
 
 func (c *dbosContext) SetWorkflowAttributes(_ Client, workflowID string, attributes map[string]any) error {
+	if err := checkReservedAttributes(attributes); err != nil {
+		return err
+	}
 	workflowState, ok := c.Value(workflowStateKey).(*workflowState)
 	isWithinWorkflow := ok && workflowState != nil
 
@@ -4584,7 +4656,8 @@ func (c *dbosContext) SetWorkflowAttributes(_ Client, workflowID string, attribu
 
 // SetWorkflowAttributes replaces the custom attributes attached to an existing
 // workflow, identified by workflowID. Pass a nil attributes map to clear all
-// attributes. Attributes must be JSON-serializable.
+// attributes. Attributes must be JSON-serializable. The reserved run-once
+// marker attribute is kept and may not be set (see WithRunOnce).
 //
 // Returns an error if the workflow does not exist or the update fails.
 //

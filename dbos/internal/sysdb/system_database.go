@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/url"
 	"reflect"
 	"regexp"
@@ -1239,6 +1240,11 @@ type InsertWorkflowResult struct {
 	Timeout           time.Duration
 	WorkflowDeadline  time.Time
 	OwnerXID          string
+	RunOnce           bool // the stored row carries the run-once marker attribute
+	// RunOnceRefused reports that this dequeue must not start the body: the row
+	// was moved to CANCELLED (a repeat dequeue of a run-once row) or ERROR (a
+	// run-once registration dequeued a row without the marker).
+	RunOnceRefused bool
 }
 
 type InsertWorkflowStatusDBInput struct {
@@ -1247,6 +1253,11 @@ type InsertWorkflowStatusDBInput struct {
 	Tx                Tx
 	OwnerXID          *string
 	IncrementAttempts bool
+	// RegistrationRunOnce is set when the dequeued workflow is registered as
+	// run-once; a row without the marker is then failed instead of run.
+	RegistrationRunOnce bool
+	// RunOnceMarkerMissingError is the encoded error recorded on such a row.
+	RunOnceMarkerMissingError string
 }
 
 func (s *SysDB) InsertWorkflowStatus(ctx context.Context, input InsertWorkflowStatusDBInput) (*InsertWorkflowResult, error) {
@@ -1308,9 +1319,15 @@ func (s *SysDB) InsertWorkflowStatus(ctx context.Context, input InsertWorkflowSt
 		className = &input.Status.ClassName
 	}
 
+	attributes := input.Status.Attributes
+	if input.Status.RunOnce {
+		attributes = make(map[string]any, len(input.Status.Attributes)+1)
+		maps.Copy(attributes, input.Status.Attributes)
+		attributes[models.RunOnceAttributeKey] = true
+	}
 	var attributesJSON *string
-	if len(input.Status.Attributes) > 0 {
-		marshaled, err := json.Marshal(input.Status.Attributes)
+	if len(attributes) > 0 {
+		marshaled, err := json.Marshal(attributes)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal workflow attributes: %w", err)
 		}
@@ -1377,7 +1394,7 @@ func (s *SysDB) InsertWorkflowStatus(ctx context.Context, input InsertWorkflowSt
                 WHEN EXCLUDED.status IN ($31, $32) THEN workflow_status.executor_id
                 ELSE EXCLUDED.executor_id
             END
-        RETURNING recovery_attempts, status, name, queue_name, queue_partition_key, workflow_timeout_ms, workflow_deadline_epoch_ms, owner_xid`, s.dialect.SchemaPrefix(s.schema))
+        RETURNING recovery_attempts, status, name, queue_name, queue_partition_key, workflow_timeout_ms, workflow_deadline_epoch_ms, owner_xid, %s`, s.dialect.SchemaPrefix(s.schema), s.runOnceMarkedSQL())
 
 	var result InsertWorkflowResult
 	var timeoutMSResult *int64
@@ -1444,6 +1461,7 @@ func (s *SysDB) InsertWorkflowStatus(ctx context.Context, input InsertWorkflowSt
 		&timeoutMSResult,
 		&workflowDeadlineEpochMS,
 		&ownerXIDReturn,
+		&result.RunOnce,
 	)
 	if ownerXIDReturn != nil {
 		result.OwnerXID = *ownerXIDReturn
@@ -1479,6 +1497,28 @@ func (s *SysDB) InsertWorkflowStatus(ctx context.Context, input InsertWorkflowSt
 		return nil, models.NewUnexpectedWorkflowError(input.Status.ID, fmt.Sprintf("Workflow already exists in a different queue: %s, but the provided queue is: %s", *result.QueueName, input.Status.QueueName))
 	}
 
+	// A dequeue is the only path that starts a queued body. A run-once row is
+	// started by its first dequeue only: any later dequeue (launch, admin or
+	// Conductor recovery, a lease re-enqueue, or a retried status insert whose
+	// first commit landed) cancels it instead, whoever owns it.
+	if input.IncrementAttempts && result.Status != models.WorkflowStatusSuccess && result.Status != models.WorkflowStatusError {
+		switch {
+		// Attempts > 1: a second start. A status other than PENDING: recovery
+		// re-enqueued the row after this dequeue claimed it, so the claim is
+		// revoked and starting the body could run it twice.
+		case result.RunOnce && (result.Attempts > 1 || result.Status != models.WorkflowStatusPending):
+			if err := s.refuseRunOnce(ctx, input.Tx, input.Status.ID, models.WorkflowStatusCancelled, nil, &result); err != nil {
+				return nil, err
+			}
+			return &result, nil
+		case input.RegistrationRunOnce && !result.RunOnce:
+			if err := s.refuseRunOnce(ctx, input.Tx, input.Status.ID, models.WorkflowStatusError, &input.RunOnceMarkerMissingError, &result); err != nil {
+				return nil, err
+			}
+			return &result, nil
+		}
+	}
+
 	// Every time we start executing a workflow (and thus attempt to insert its status), we increment `recovery_attempts` by 1.
 	// When this number becomes equal to `maxRetries + 1`, we mark the workflow as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
 	if result.Status != models.WorkflowStatusSuccess && result.Status != models.WorkflowStatusError &&
@@ -1507,6 +1547,29 @@ func (s *SysDB) InsertWorkflowStatus(ctx context.Context, input InsertWorkflowSt
 	}
 
 	return &result, nil
+}
+
+// refuseRunOnce ends a dequeued run-once workflow without starting its body,
+// moving a PENDING or ENQUEUED row to status (CANCELLED or ERROR, with errStr
+// recorded). The body is refused whatever the row's status.
+func (s *SysDB) refuseRunOnce(ctx context.Context, tx Tx, workflowID string, status models.WorkflowStatusType, errStr *string, result *InsertWorkflowResult) error {
+	query := s.RenderSQL(`UPDATE %sworkflow_status
+			SET status = $1, error = COALESCE($2, error), updated_at = $3, completed_at = $3,
+			    started_at_epoch_ms = NULL, queue_name = NULL, deduplication_id = NULL
+			WHERE workflow_uuid = $4 AND status IN ($5, $6)`, s.dialect.SchemaPrefix(s.schema))
+	res, err := tx.Exec(ctx, query, status, errStr, time.Now().UnixMilli(), workflowID, models.WorkflowStatusPending, models.WorkflowStatusEnqueued)
+	if err != nil {
+		return fmt.Errorf("failed to refuse run-once workflow %s: %w", workflowID, err)
+	}
+	updated, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check run-once refusal of workflow %s: %w", workflowID, err)
+	}
+	if updated > 0 {
+		result.Status = status
+	}
+	result.RunOnceRefused = true
+	return nil
 }
 
 // ListWorkflowsDBInput represents the input parameters for listing workflows.
@@ -1557,6 +1620,7 @@ func (s *SysDB) ListWorkflows(ctx context.Context, input ListWorkflowsDBInput) (
 		"attributes", "schedule_name", "debounce_deadline_epoch_ms", "is_debounced", "application_name",
 	}
 
+	loadColumns = append(loadColumns, s.runOnceMarkedSQL())
 	if input.LoadOutput {
 		loadColumns = append(loadColumns, "output", "error")
 	}
@@ -1741,6 +1805,7 @@ func (s *SysDB) ListWorkflows(ctx context.Context, input ListWorkflowsDBInput) (
 			&deadlineMs, &startedAtMs, &deduplicationID, &wf.Priority, &queuePartitionKey, &forkedFrom, &parentWorkflowID,
 			&serialization, &delayUntilEpochMs, &wf.WasForkedFrom, &completedAtMs, &className, &wf.ConfigName,
 			&attributesJSON, &scheduleName, &debounceDeadlineEpochMs, &wf.IsDebounced, &applicationName,
+			&wf.RunOnce,
 		}
 
 		if input.LoadOutput {
@@ -1812,6 +1877,12 @@ func (s *SysDB) ListWorkflows(ctx context.Context, input ListWorkflowsDBInput) (
 		if attributesJSON != nil && len(*attributesJSON) > 0 {
 			if err := json.Unmarshal([]byte(*attributesJSON), &wf.Attributes); err != nil {
 				return nil, fmt.Errorf("failed to unmarshal attributes: %w", err)
+			}
+			// The marker is reported as RunOnce, so a read-modify-write of the
+			// attributes does not carry the reserved key.
+			delete(wf.Attributes, models.RunOnceAttributeKey)
+			if len(wf.Attributes) == 0 {
+				wf.Attributes = nil
 			}
 		}
 
@@ -1926,12 +1997,33 @@ type SetWorkflowAttributesDBInput struct {
 }
 
 // SetWorkflowAttributes replaces the custom attributes attached to an existing
-// workflow. A nil/empty attributes map clears them (stored as NULL). Returns a
-// non-existent workflow error if no workflow with the given ID exists.
+// workflow. A nil/empty attributes map clears them (stored as NULL), except the
+// run-once marker, which is kept. Returns a non-existent workflow error if no
+// workflow with the given ID exists.
 func (s *SysDB) SetWorkflowAttributes(ctx context.Context, input SetWorkflowAttributesDBInput) error {
+	var runner Querier = s.pool
+	if input.Tx != nil {
+		runner = input.Tx
+	}
+	// The run-once marker outlives any replacement: it is fixed at insert.
+	var marked bool
+	markedQuery := s.RenderSQL(`SELECT %s FROM %sworkflow_status WHERE workflow_uuid = $1`, s.runOnceMarkedSQL(), s.dialect.SchemaPrefix(s.schema))
+	switch err := runner.QueryRow(ctx, markedQuery, input.WorkflowID).Scan(&marked); {
+	case errors.Is(err, ErrNoRows):
+		return models.NewNonExistentWorkflowError(input.WorkflowID)
+	case err != nil:
+		return fmt.Errorf("failed to read workflow attributes: %w", err)
+	}
+	attributes := input.Attributes
+	if marked {
+		attributes = make(map[string]any, len(input.Attributes)+1)
+		maps.Copy(attributes, input.Attributes)
+		attributes[models.RunOnceAttributeKey] = true
+	}
+
 	var attributesJSON *string
-	if len(input.Attributes) > 0 {
-		marshaled, err := json.Marshal(input.Attributes)
+	if len(attributes) > 0 {
+		marshaled, err := json.Marshal(attributes)
 		if err != nil {
 			return fmt.Errorf("failed to marshal workflow attributes: %w", err)
 		}
@@ -2352,6 +2444,8 @@ type ResumeWorkflowsDBInput struct {
 // ResumeWorkflows re-enqueues the given workflows onto the specified queue (or the internal
 // queue if unset). It returns the subset of IDs that existed in workflow_status; IDs in
 // terminal states are considered existing even though they are not updated.
+// A batch naming a run-once workflow is refused whole: nothing is written and a
+// RunOnceWorkflow error names the first such workflow.
 func (s *SysDB) ResumeWorkflows(ctx context.Context, input ResumeWorkflowsDBInput) ([]string, error) {
 	if len(input.WorkflowIDs) == 0 {
 		return nil, nil
@@ -2406,6 +2500,29 @@ func (s *SysDB) ResumeWorkflows(ctx context.Context, input ResumeWorkflowsDBInpu
 			runner = tx
 		}
 
+		runOnceQuery := s.RenderSQL(`SELECT workflow_uuid FROM %sworkflow_status WHERE %s AND %s`, schemaPrefix, selectAnyClause, s.runOnceMarkedSQL())
+		runOnceRows, err := runner.Query(ctx, runOnceQuery, args[4])
+		if err != nil {
+			return nil, fmt.Errorf("failed to check resumed workflows for run-once: %w", err)
+		}
+		var runOnceIDs []string
+		for runOnceRows.Next() {
+			var id string
+			if err := runOnceRows.Scan(&id); err != nil {
+				runOnceRows.Close()
+				return nil, fmt.Errorf("failed to scan run-once workflow id: %w", err)
+			}
+			runOnceIDs = append(runOnceIDs, id)
+		}
+		if cerr := runOnceRows.Close(); cerr != nil {
+			return nil, fmt.Errorf("failed to close run-once workflow rows: %w", cerr)
+		}
+		if err := runOnceRows.Err(); err != nil {
+			return nil, fmt.Errorf("failed to read run-once workflow ids: %w", err)
+		}
+		if len(runOnceIDs) > 0 {
+			return nil, newRunOnceRefusal("resumed", runOnceIDs, len(input.WorkflowIDs))
+		}
 		if _, err := runner.Exec(ctx, updateQuery, args...); err != nil {
 			return nil, fmt.Errorf("failed to resume workflows: %w", err)
 		}
@@ -2439,17 +2556,20 @@ func (s *SysDB) ResumeWorkflows(ctx context.Context, input ResumeWorkflowsDBInpu
 		return found, nil
 	}
 
+	// The update and the run-once check share one statement snapshot, so a
+	// batch naming a run-once workflow writes nothing.
 	query := s.RenderSQL(`WITH existing AS (
-			SELECT workflow_uuid FROM %sworkflow_status WHERE %s
+			SELECT workflow_uuid, %s AS run_once FROM %sworkflow_status WHERE %s
 		), updated AS (
 			UPDATE %sworkflow_status
 			SET status = $1, queue_name = $2, recovery_attempts = $3,
 			    workflow_deadline_epoch_ms = NULL, deduplication_id = NULL,
 			    started_at_epoch_ms = NULL, updated_at = $4, completed_at = NULL
 			WHERE %s AND status NOT IN ($6, $7)
+			  AND NOT EXISTS (SELECT 1 FROM existing WHERE run_once)
 			RETURNING workflow_uuid
 		)
-		SELECT workflow_uuid FROM existing`, schemaPrefix, anyClause, schemaPrefix, anyClause)
+		SELECT workflow_uuid, run_once FROM existing`, s.runOnceMarkedSQL(), schemaPrefix, anyClause, schemaPrefix, anyClause)
 
 	var rows Rows
 	if input.Tx != nil {
@@ -2463,17 +2583,44 @@ func (s *SysDB) ResumeWorkflows(ctx context.Context, input ResumeWorkflowsDBInpu
 	defer rows.Close()
 
 	found := make([]string, 0, len(input.WorkflowIDs))
+	var runOnceIDs []string
 	for rows.Next() {
 		var id string
-		if err := rows.Scan(&id); err != nil {
+		var runOnce bool
+		if err := rows.Scan(&id, &runOnce); err != nil {
 			return nil, fmt.Errorf("failed to scan resumed workflow id: %w", err)
+		}
+		if runOnce {
+			runOnceIDs = append(runOnceIDs, id)
 		}
 		found = append(found, id)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("failed to read resumed workflow ids: %w", err)
 	}
+	if len(runOnceIDs) > 0 {
+		return nil, newRunOnceRefusal("resumed", runOnceIDs, len(input.WorkflowIDs))
+	}
 	return found, nil
+}
+
+// runOnceMarkedSQL is a non-NULL boolean SQL expression telling whether the
+// row's attributes carry the run-once marker.
+func (s *SysDB) runOnceMarkedSQL() string {
+	if s.dialect.SupportsAttributesContainment() {
+		return `COALESCE(attributes @> '{"` + models.RunOnceAttributeKey + `": true}'::jsonb, FALSE)`
+	}
+	return `COALESCE(json_extract(attributes, '$."` + models.RunOnceAttributeKey + `"'), 0) = 1`
+}
+
+// newRunOnceRefusal refuses a resume or fork ("resumed"/"forked") of a batch
+// naming the given run-once workflows.
+func newRunOnceRefusal(verb string, runOnceIDs []string, batchSize int) error {
+	reason := "cannot be " + verb
+	if batchSize > len(runOnceIDs) {
+		reason += "; the whole batch of workflows was refused and none was " + verb
+	}
+	return models.NewRunOnceWorkflowsError(runOnceIDs, reason)
 }
 
 type ForkWorkflowsDBInput struct {
@@ -2537,10 +2684,19 @@ func (s *SysDB) ForkWorkflows(ctx context.Context, input ForkWorkflowsDBInput) (
 	for _, wf := range wfs {
 		statusByID[wf.ID] = wf
 	}
+	var runOnceIDs []string
 	for _, id := range input.OriginalWorkflowIDs {
-		if _, ok := statusByID[id]; !ok {
+		wf, ok := statusByID[id]
+		if !ok {
 			return nil, models.NewNonExistentWorkflowError(id)
 		}
+		// The marker is fixed at insert, so this read in the write's tx cannot go stale.
+		if wf.RunOnce {
+			runOnceIDs = append(runOnceIDs, id)
+		}
+	}
+	if len(runOnceIDs) > 0 {
+		return nil, newRunOnceRefusal("forked", runOnceIDs, len(input.OriginalWorkflowIDs))
 	}
 
 	// Determine the queue to place the forked workflows on
@@ -4076,7 +4232,8 @@ type WorkflowSendInput struct {
 // Can be called both within a workflow (as a step) or outside a workflow (directly).
 // When called within a workflow: durability and the function run in the same transaction, and we forbid nested step execution
 func (s *SysDB) Send(ctx context.Context, input WorkflowSendInput) error {
-	if _, ok := input.Message.(*string); !ok {
+	message, ok := input.Message.(*string)
+	if !ok {
 		return fmt.Errorf("message must be a pointer to a string")
 	}
 
@@ -4102,7 +4259,12 @@ func (s *SysDB) Send(ctx context.Context, input WorkflowSendInput) error {
 		_, err = s.pool.Exec(ctx, insertQuery, input.DestinationID, topic, input.Message, input.Serialization, messageUUID, createdAtMs)
 	}
 	if err != nil {
-		s.logger.Error("failed to insert notification", "error", err, "query", insertQuery, "destination_id", input.DestinationID, "topic", topic, "message", input.Message)
+		// Log the message size, never its content: messages can carry secrets.
+		messageBytes := 0
+		if message != nil {
+			messageBytes = len(*message)
+		}
+		s.logger.Error("failed to insert notification", "error", err, "query", insertQuery, "destination_id", input.DestinationID, "topic", topic, "message_bytes", messageBytes)
 		// Check for foreign key violation (destination workflow doesn't exist)
 		if s.dialect.IsForeignKeyViolation(err) {
 			return models.NewNonExistentWorkflowError(input.DestinationID)
@@ -5055,13 +5217,27 @@ func (s *SysDB) ReenqueueForRecovery(ctx context.Context, executorIDs []string, 
 		args = append(args, s.appName)
 		appNameClause = " AND " + nameFilterSQL("application_name", len(args))
 	}
+
+	// A run-once workflow whose body already started is cancelled rather than
+	// re-enqueued: a re-enqueued row would wait for a queue or process permit
+	// that its own live body may hold, while that body keeps running. A row that
+	// never started (recovery_attempts = 0) is re-enqueued, and its first
+	// dequeue starts it. One statement classifies each row: a dispatch that
+	// holds the row while it records the first start makes this UPDATE wait and
+	// re-read the row, so it sees recovery_attempts = 1.
+	args = append(args, models.WorkflowStatusCancelled)
+	cancelArg := len(args)
+	cancel := fmt.Sprintf("(%s AND recovery_attempts >= 1)", s.runOnceMarkedSQL())
 	// NULLIF: legacy rows stored not-enqueued as '' rather than NULL
 	query := s.RenderSQL(`UPDATE %sworkflow_status
-			  SET status = $1, started_at_epoch_ms = NULL, updated_at = $2,
-			      queue_name = COALESCE(NULLIF(queue_name, ''), $3)
+			  SET status = CASE WHEN %[2]s THEN $%[3]d ELSE $1 END,
+			      started_at_epoch_ms = NULL, updated_at = $2,
+			      completed_at = CASE WHEN %[2]s THEN $2 ELSE completed_at END,
+			      deduplication_id = CASE WHEN %[2]s THEN NULL ELSE deduplication_id END,
+			      queue_name = CASE WHEN %[2]s THEN NULL ELSE COALESCE(NULLIF(queue_name, ''), $3) END
 			  WHERE status = $4
-			    AND %s%s%s
-			  RETURNING workflow_uuid`, s.dialect.SchemaPrefix(s.schema), executorClause, versionClause, appNameClause)
+			    AND %[4]s%[5]s%[6]s
+			  RETURNING workflow_uuid, status`, s.dialect.SchemaPrefix(s.schema), cancel, cancelArg, executorClause, versionClause, appNameClause)
 
 	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
@@ -5069,16 +5245,23 @@ func (s *SysDB) ReenqueueForRecovery(ctx context.Context, executorIDs []string, 
 	}
 	defer rows.Close()
 
-	var workflowIDs []string
+	var workflowIDs, cancelledIDs []string
 	for rows.Next() {
 		var id string
-		if err := rows.Scan(&id); err != nil {
+		var status models.WorkflowStatusType
+		if err := rows.Scan(&id, &status); err != nil {
 			return nil, fmt.Errorf("failed to scan re-enqueued workflow id: %w", err)
 		}
 		workflowIDs = append(workflowIDs, id)
+		if status == models.WorkflowStatusCancelled {
+			cancelledIDs = append(cancelledIDs, id)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("failed to read re-enqueued workflow ids: %w", err)
+	}
+	if len(cancelledIDs) > 0 {
+		s.logger.Warn("Cancelled run-once workflows instead of recovering them", "workflow_ids", cancelledIDs)
 	}
 	return workflowIDs, nil
 }

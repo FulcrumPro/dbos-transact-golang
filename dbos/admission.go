@@ -14,6 +14,7 @@ type workflowAdmission struct {
 	mu          sync.Mutex
 	limit       int
 	current     int
+	exempt      map[string]bool
 	queueCounts map[admissionQueueKey]int
 	queueLimits map[string]int
 	waiters     []*workflowAdmissionWaiter
@@ -27,9 +28,16 @@ type workflowAdmissionWaiter struct {
 	queue      bool
 }
 
-func newWorkflowAdmission(limit int) *workflowAdmission {
+// newWorkflowAdmission caps root workflows at limit (zero means unlimited).
+// Roots dequeued from an exempt queue hold only their queue permit.
+func newWorkflowAdmission(limit int, exemptQueues []string) *workflowAdmission {
+	exempt := make(map[string]bool, len(exemptQueues))
+	for _, name := range exemptQueues {
+		exempt[name] = true
+	}
 	return &workflowAdmission{
 		limit:       limit,
+		exempt:      exempt,
 		queueCounts: make(map[admissionQueueKey]int),
 		queueLimits: make(map[string]int),
 		wake:        make(chan struct{}),
@@ -120,7 +128,7 @@ func (a *workflowAdmission) reserveLocked(key admissionQueueKey, process, queue 
 }
 
 func (a *workflowAdmission) permitKinds(key admissionQueueKey) (process, queue bool) {
-	return a.limit > 0, key.queueName != ""
+	return a.limit > 0 && !a.exempt[key.queueName], key.queueName != ""
 }
 
 func (a *workflowAdmission) tryAcquire(key admissionQueueKey, queueLimit int) (*workflowAdmissionToken, bool) {

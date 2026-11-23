@@ -202,6 +202,7 @@ type setupDBOSOptions struct {
 	serializer               Serializer[any]
 	schedulerPollingInterval time.Duration
 	maxConcurrentWorkflows   int
+	processCapExemptQueues   []string
 	databaseURL              string // share another test's database (sqlite URLs are per-*testing.T otherwise)
 	appName                  string // application name (defaults to "test-app")
 }
@@ -231,6 +232,7 @@ func setupDBOS(t *testing.T, opts setupDBOSOptions) Context {
 		Serializer:               opts.serializer,
 		SchedulerPollingInterval: opts.schedulerPollingInterval,
 		MaxConcurrentWorkflows:   opts.maxConcurrentWorkflows,
+		ProcessCapExemptQueues:   opts.processCapExemptQueues,
 	}
 
 	dbosCtx, err := NewContext(context.Background(), config)
