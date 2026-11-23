@@ -516,6 +516,7 @@ type WorkflowRegistryEntry struct {
 	FQN             string // Fully qualified name of the workflow function. For configured instances, qualified with the config name.
 	ClassName       string // Receiver type name for configured instance workflows
 	ConfigName      string // Config name for configured instance workflows
+	RunOnce         bool   // Registered with WithRunOnce: the body starts at most once, from its queue
 }
 
 func registerWorkflow(ctx Context, entry WorkflowRegistryEntry) {
@@ -579,6 +580,7 @@ type workflowRegistrationOptions struct {
 	maxRetries int
 	name       string
 	instance   ConfiguredInstance
+	runOnce    bool
 }
 
 type WorkflowRegistrationOption func(*workflowRegistrationOptions)
@@ -622,6 +624,25 @@ func WithWorkflowName(name string) WorkflowRegistrationOption {
 func WithInstance(instance ConfiguredInstance) WorkflowRegistrationOption {
 	return func(p *workflowRegistrationOptions) {
 		p.instance = instance
+	}
+}
+
+// WithRunOnce registers a workflow whose body must start at most once: a body
+// that is interrupted is not run again. Use it for a body that cannot replay
+// safely, such as one holding state that lives only in its own execution.
+//
+// A run-once workflow is started only by dequeueing it: enqueue it with
+// WithQueue and WithRunOnceMarker (or WithEnqueueRunOnce from a client).
+//   - The first dequeue runs the body. Any later dequeue of the same workflow
+//     (launch, admin, or Conductor recovery; a retried start) moves it to
+//     CANCELLED without running the body, even while the first run is alive.
+//   - Resuming or forking it fails with ErrRunOnceWorkflow and writes nothing.
+//   - Starting it directly (without a queue) fails with ErrRunOnceWorkflow.
+//   - A row dequeued without the marker (enqueued by an older binary, the SQL
+//     enqueue function, an import, or a schedule) ends in ERROR unrun.
+func WithRunOnce() WorkflowRegistrationOption {
+	return func(p *workflowRegistrationOptions) {
+		p.runOnce = true
 	}
 }
 
@@ -774,6 +795,7 @@ func RegisterWorkflow[P any, R any](ctx Context, fn Workflow[P, R], opts ...Work
 		Name:            registrationParams.name,
 		ClassName:       className,
 		ConfigName:      configName,
+		RunOnce:         registrationParams.runOnce,
 	})
 
 }
@@ -846,26 +868,27 @@ const (
 )
 
 type workflowOptions struct {
-	WorkflowName         string
-	WorkflowID           string
-	queue                Queue
-	ApplicationVersion   string
-	MaxRetries           int
-	DeduplicationID      string
-	DeduplicationPolicy  DeduplicationPolicy
-	Priority             uint
-	AuthenticatedUser    string
-	AssumedRole          string
-	AuthenticatedRoles   []string
-	QueuePartitionKey    string
-	DelayDuration        time.Duration
-	WorkflowAttributes   map[string]any
-	alreadyEncodedInput  bool
-	isDequeue            bool
-	isPortableWorkflow   bool
-	runInstance          ConfiguredInstance
-	admissionToken       *workflowAdmissionToken
-	err                  error // invalid option usage, surfaced when options are parsed
+	WorkflowName        string
+	WorkflowID          string
+	queue               Queue
+	ApplicationVersion  string
+	MaxRetries          int
+	DeduplicationID     string
+	DeduplicationPolicy DeduplicationPolicy
+	Priority            uint
+	AuthenticatedUser   string
+	AssumedRole         string
+	AuthenticatedRoles  []string
+	QueuePartitionKey   string
+	DelayDuration       time.Duration
+	WorkflowAttributes  map[string]any
+	runOnceMarker       bool
+	alreadyEncodedInput bool
+	isDequeue           bool
+	isPortableWorkflow  bool
+	runInstance         ConfiguredInstance
+	admissionToken      *workflowAdmissionToken
+	err                 error // invalid option usage, surfaced when options are parsed
 }
 
 // WorkflowOption is a functional option for configuring workflow execution parameters.
@@ -960,6 +983,14 @@ func WithWorkflowAttributes(attributes map[string]any) WorkflowOption {
 func WithDelay(delay time.Duration) WorkflowOption {
 	return func(p *workflowOptions) {
 		p.DelayDuration = delay
+	}
+}
+
+// WithRunOnceMarker marks an enqueued workflow as run-once: its body starts at
+// most once (see WithRunOnce). Must be used together with WithQueue.
+func WithRunOnceMarker() WorkflowOption {
+	return func(p *workflowOptions) {
+		p.runOnceMarker = true
 	}
 }
 
@@ -1224,6 +1255,16 @@ func (c *dbosContext) RunWorkflow(_ Context, fn WorkflowFunc, input any, opts ..
 		return nil, models.NewInvalidOptionError("priority provided but queue name is missing")
 	}
 
+	// Run-once workflows start only from their queue
+	if params.runOnceMarker && params.queue == nil {
+		c.logger.Error("run-once marker provided but queue name is missing", "workflow_name", params.WorkflowName)
+		return nil, models.NewInvalidOptionError("run-once marker provided but queue name is missing")
+	}
+	if registeredWorkflow.RunOnce && params.queue == nil && !params.isDequeue {
+		c.logger.Error("run-once workflow started without a queue", "workflow_name", params.WorkflowName)
+		return nil, models.NewRunOnceWorkflowError(params.WorkflowID, "it can only be started by enqueueing it with the run-once marker")
+	}
+
 	// Validate partition key and deduplication ID are not both provided (they are incompatible)
 	if len(params.QueuePartitionKey) > 0 && len(params.DeduplicationID) > 0 {
 		c.logger.Error("partition key and deduplication ID cannot be used together", "workflow_name", params.WorkflowName)
@@ -1438,6 +1479,7 @@ func (c *dbosContext) RunWorkflow(_ Context, fn WorkflowFunc, input any, opts ..
 		QueuePartitionKey:  params.QueuePartitionKey,
 		DelayUntil:         delayUntil,
 		Attributes:         params.WorkflowAttributes,
+		RunOnce:            params.runOnceMarker,
 		Serialization: func() string {
 			if params.isPortableWorkflow {
 				return PortableSerializerName
@@ -1469,6 +1511,12 @@ func (c *dbosContext) RunWorkflow(_ Context, fn WorkflowFunc, input any, opts ..
 			Tx:                tx,
 			OwnerXID:          &ownerXID,
 			IncrementAttempts: params.isDequeue,
+		}
+		if params.isDequeue && registeredWorkflow.RunOnce {
+			insertInput.RegistrationRunOnce = true
+			insertInput.RunOnceMarkerMissingError = serializeWorkflowError(c.logger,
+				models.NewRunOnceWorkflowError(workflowID, "run-once workflow enqueued without the run-once marker"),
+				workflowStatus.Serialization)
 		}
 		insertStatusResult, err = c.systemDB.InsertWorkflowStatus(uncancellableCtx, insertInput)
 		if err != nil {
@@ -1508,8 +1556,12 @@ func (c *dbosContext) RunWorkflow(_ Context, fn WorkflowFunc, input any, opts ..
 				insertStatusResult.Status == WorkflowStatusSuccess || // workflow is in a terminal state (success) OR
 				insertStatusResult.Status == WorkflowStatusError || // workflow is in a terminal state (error) OR
 				(!params.isDequeue && insertStatusResult.OwnerXID != ownerXID) || // another executor, not us dequeueing, is already owning the workflow OR
+				insertStatusResult.RunOnceRefused || // a run-once workflow already started once (or lacks its marker) OR
 				loaded // this executor is already running the workflow
 
+		if insertStatusResult.RunOnceRefused {
+			c.logger.Warn("run-once workflow not started", "workflow_id", workflowID, "status", insertStatusResult.Status, "attempts", insertStatusResult.Attempts, "marked", insertStatusResult.RunOnce)
+		}
 		if shouldSkip {
 			// Commit the transaction to update the number of attempts and/or enact the enqueue
 			if err := tx.Commit(uncancellableCtx); err != nil {
@@ -1949,7 +2001,16 @@ func WithEnqueueAttributes(attributes map[string]any) EnqueueOption {
 	}
 }
 
+// WithEnqueueRunOnce marks the enqueued workflow as run-once: its body starts at
+// most once (see WithRunOnce).
+func WithEnqueueRunOnce() EnqueueOption {
+	return func(opts *enqueueOptions) {
+		opts.runOnce = true
+	}
+}
+
 type enqueueOptions struct {
+	runOnce             bool
 	workflowName        string
 	workflowID          string
 	applicationVersion  string
@@ -2104,6 +2165,7 @@ func (c *dbosContext) Enqueue(_ Client, queueName, workflowName string, input an
 		Attributes:         params.attributes,
 		DebounceDeadline:   params.debounceDeadline,
 		IsDebounced:        params.isDebounced,
+		RunOnce:            params.runOnce,
 	}
 	if isWithinWorkflow {
 		status.ParentWorkflowID = wfState.workflowID

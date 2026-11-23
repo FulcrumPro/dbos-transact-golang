@@ -34,6 +34,7 @@ const (
 	ErrorCodeQueueNotFound
 	ErrorCodeScheduleNotFound
 	ErrorCodeInvalidOption
+	ErrorCodeRunOnceWorkflow
 
 	// _errorCodeSentinel must remain the last value: it bounds parseErrorCode.
 	_errorCodeSentinel
@@ -82,6 +83,8 @@ func (c ErrorCode) String() string {
 		return "ScheduleNotFound"
 	case ErrorCodeInvalidOption:
 		return "InvalidOption"
+	case ErrorCodeRunOnceWorkflow:
+		return "RunOnceWorkflow"
 	default:
 		return fmt.Sprintf("ErrorCode(%d)", int(c))
 	}
@@ -384,6 +387,20 @@ func NewInvalidOptionError(message string) *Error {
 	return &Error{
 		Message: message,
 		Code:    ErrorCodeInvalidOption,
+	}
+}
+
+// NewRunOnceWorkflowError reports an operation refused because it would run the
+// body of a run-once workflow a second time, or outside its queue.
+func NewRunOnceWorkflowError(workflowID, reason string) *Error {
+	subject := "workflow"
+	if workflowID != "" {
+		subject = "workflow " + workflowID
+	}
+	return &Error{
+		Message:    fmt.Sprintf("%s is run-once: %s", subject, reason),
+		Code:       ErrorCodeRunOnceWorkflow,
+		WorkflowID: workflowID,
 	}
 }
 

@@ -41,4 +41,8 @@ var (
 	ErrNoApplicationVersions = &Error{Code: ErrorCodeNoApplicationVersions}
 	// ErrInvalidOption matches errors from invalid or inconsistent options passed to a DBOS API.
 	ErrInvalidOption = &Error{Code: ErrorCodeInvalidOption}
+	// ErrRunOnceWorkflow matches errors refusing to resume, fork, or directly start a
+	// run-once workflow, and the error recorded on a run-once workflow enqueued
+	// without the run-once marker.
+	ErrRunOnceWorkflow = &Error{Code: ErrorCodeRunOnceWorkflow}
 )

@@ -55,6 +55,7 @@ type WorkflowStatus struct {
 	DebounceDeadline   time.Time          `json:"debounce_deadline,omitzero"`    // Absolute cap beyond which debounce calls may not extend the delay (zero = no cap)
 	IsDebounced        bool               `json:"is_debounced,omitempty"`        // Whether the deduplication ID is a debounce key to clear on the DELAYED->ENQUEUED transition
 	ApplicationName    string             `json:"application_name,omitempty"`    // Owning application; empty if unclaimed (any application may run it)
+	RunOnce            bool               `json:"run_once,omitempty"`            // Whether the workflow carries the run-once marker: its body starts at most once
 }
 
 // MarshalJSON renders Timeout as integer milliseconds (timeout_ms), matching the
