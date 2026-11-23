@@ -25,10 +25,27 @@ func TestMaxConcurrentWorkflowsConfig(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Zero(t, config.MaxConcurrentWorkflows)
+
+	_, err = processConfig(&Config{
+		AppName:                "test",
+		DatabaseURL:            "sqlite::memory:",
+		ProcessCapExemptQueues: []string{"qbwc", ""},
+	})
+	require.EqualError(t, err, "processCapExemptQueues cannot contain an empty queue name")
+
+	exempt := []string{"qbwc"}
+	config, err = processConfig(&Config{
+		AppName:                "test",
+		DatabaseURL:            "sqlite::memory:",
+		ProcessCapExemptQueues: exempt,
+	})
+	require.NoError(t, err)
+	exempt[0] = "changed"
+	require.Equal(t, []string{"qbwc"}, config.ProcessCapExemptQueues)
 }
 
 func TestWorkflowAdmissionAcquireAndRelease(t *testing.T) {
-	admission := newWorkflowAdmission(1)
+	admission := newWorkflowAdmission(1, nil)
 	first, ok := admission.tryAcquire(admissionQueueKey{}, -1)
 	require.True(t, ok)
 	current, limit := admission.state()
@@ -65,7 +82,7 @@ func TestWorkflowAdmissionAcquireAndRelease(t *testing.T) {
 }
 
 func TestWorkflowAdmissionCancelledWaiterDoesNotLeak(t *testing.T) {
-	admission := newWorkflowAdmission(1)
+	admission := newWorkflowAdmission(1, nil)
 	first, ok := admission.tryAcquire(admissionQueueKey{}, -1)
 	require.True(t, ok)
 
@@ -94,7 +111,7 @@ func TestWorkflowAdmissionCancelledWaiterDoesNotLeak(t *testing.T) {
 }
 
 func TestWorkflowAdmissionQueueReservationCombinesLimits(t *testing.T) {
-	admission := newWorkflowAdmission(2)
+	admission := newWorkflowAdmission(2, nil)
 	queueA := admissionQueueKey{queueName: "queue-a"}
 	queueB := admissionQueueKey{queueName: "queue-b"}
 
@@ -121,7 +138,7 @@ func TestWorkflowAdmissionQueueReservationCombinesLimits(t *testing.T) {
 }
 
 func TestWorkflowAdmissionUsesLatestQueueLimit(t *testing.T) {
-	admission := newWorkflowAdmission(0)
+	admission := newWorkflowAdmission(0, nil)
 	key := admissionQueueKey{queueName: "queue"}
 	first, ok := admission.tryAcquire(key, 2)
 	require.True(t, ok)
@@ -142,7 +159,7 @@ func TestWorkflowAdmissionUsesLatestQueueLimit(t *testing.T) {
 }
 
 func TestWorkflowAdmissionQueuedReservationDoesNotBargeWaitingRoot(t *testing.T) {
-	admission := newWorkflowAdmission(1)
+	admission := newWorkflowAdmission(1, nil)
 	first, ok := admission.tryAcquire(admissionQueueKey{}, -1)
 	require.True(t, ok)
 
@@ -174,7 +191,7 @@ func TestWorkflowAdmissionQueuedReservationDoesNotBargeWaitingRoot(t *testing.T)
 
 func TestWorkflowAdmissionTracksUnlimitedQueueRoots(t *testing.T) {
 	key := admissionQueueKey{queueName: "queue"}
-	admission := newWorkflowAdmission(0)
+	admission := newWorkflowAdmission(0, nil)
 	first, ok := admission.tryAcquire(key, -1)
 	require.True(t, ok)
 	require.Equal(t, 1, admission.queueCount(key))
@@ -191,13 +208,170 @@ func TestWorkflowAdmissionTracksUnlimitedQueueRoots(t *testing.T) {
 }
 
 func TestWorkflowAdmissionUnlimitedQueueDoesNotConsumeProcessCapacity(t *testing.T) {
-	admission := newWorkflowAdmission(0)
+	admission := newWorkflowAdmission(0, nil)
 	token, ok := admission.tryAcquire(admissionQueueKey{queueName: "queue"}, -1)
 	require.True(t, ok)
 	current, limit := admission.state()
 	require.Zero(t, current)
 	require.Zero(t, limit)
 	token.release()
+}
+
+func TestWorkflowAdmissionExemptQueueHoldsOnlyQueuePermit(t *testing.T) {
+	admission := newWorkflowAdmission(1, []string{"exempt"})
+	normalKey := admissionQueueKey{queueName: "normal"}
+	exemptKey := admissionQueueKey{queueName: "exempt"}
+
+	normal, ok := admission.tryAcquire(normalKey, -1)
+	require.True(t, ok)
+	_, ok = admission.tryAcquire(normalKey, -1)
+	require.False(t, ok, "a normal queue must stay under the process cap")
+	_, ok = admission.tryAcquire(admissionQueueKey{}, -1)
+	require.False(t, ok, "a non-queued root must stay under the process cap")
+
+	exempt1, ok := admission.tryAcquire(exemptKey, 2)
+	require.True(t, ok, "an exempt queue must not wait for process capacity")
+	exempt2, ok := admission.tryAcquire(exemptKey, 2)
+	require.True(t, ok)
+	_, ok = admission.tryAcquire(exemptKey, 2)
+	require.False(t, ok, "an exempt queue must stay under its own worker limit")
+	current, _ := admission.state()
+	require.Equal(t, 1, current)
+	require.Equal(t, 2, admission.queueCount(exemptKey))
+
+	normal.release()
+	exempt1.release()
+	exempt2.release()
+	current, _ = admission.state()
+	require.Zero(t, current)
+	require.Zero(t, admission.queueCount(exemptKey))
+	require.Zero(t, admission.queueCount(normalKey))
+}
+
+// TestProcessCapExemptQueue runs an exempt queue past its own worker limit and
+// two normal queues past the process cap at the same time, twice, so a permit
+// leaked by the first batch would starve the second.
+func TestProcessCapExemptQueue(t *testing.T) {
+	const (
+		processCap      = 5
+		exemptLimit     = 3
+		exemptEnqueued  = 5
+		normalPerQueue  = 4
+		quietWindow     = 200 * time.Millisecond
+		startTimeout    = 10 * time.Second
+		exemptQueueName = "admission-exempt-qbwc"
+	)
+	dbosCtx := setupDBOS(t, setupDBOSOptions{
+		dropDB:                 true,
+		checkLeaks:             true,
+		maxConcurrentWorkflows: processCap,
+		processCapExemptQueues: []string{exemptQueueName},
+	})
+
+	releases := map[string]chan struct{}{}
+	for _, batch := range []string{"0", "1"} {
+		releases["exempt-"+batch] = make(chan struct{})
+		releases["normal-"+batch] = make(chan struct{})
+	}
+	t.Cleanup(func() {
+		for _, release := range releases {
+			select {
+			case <-release:
+			default:
+				close(release)
+			}
+		}
+	})
+	started := make(chan string, 2*(exemptEnqueued+2*normalPerQueue))
+	workflow := func(_ Context, group string) (string, error) {
+		started <- group
+		<-releases[group]
+		return group, nil
+	}
+	RegisterWorkflow(dbosCtx, workflow)
+	exemptQueue, err := registerWFQ(dbosCtx, exemptQueueName,
+		WithWorkerConcurrency(exemptLimit),
+		WithQueueBasePollingInterval(10*time.Millisecond))
+	require.NoError(t, err)
+	normalA, err := registerWFQ(dbosCtx, "admission-exempt-normal-a", WithQueueBasePollingInterval(10*time.Millisecond))
+	require.NoError(t, err)
+	normalB, err := registerWFQ(dbosCtx, "admission-exempt-normal-b", WithQueueBasePollingInterval(10*time.Millisecond))
+	require.NoError(t, err)
+	require.NoError(t, Launch(dbosCtx))
+
+	admission := dbosCtx.(*dbosContext).admission
+	exemptKey := admissionQueueKey{queueName: exemptQueue.Name}
+	normalAKey := admissionQueueKey{queueName: normalA.Name}
+	normalBKey := admissionQueueKey{queueName: normalB.Name}
+	processCurrent := func() int {
+		current, _ := admission.state()
+		return current
+	}
+	requireStarts := func(group string, want int) {
+		t.Helper()
+		for got := 0; got < want; got++ {
+			select {
+			case g := <-started:
+				require.Equal(t, group, g)
+			case <-time.After(startTimeout):
+				t.Fatalf("%s: %d of %d roots started", group, got, want)
+			}
+		}
+		select {
+		case g := <-started:
+			t.Fatalf("%s: more than %d roots started (extra %s)", group, want, g)
+		case <-time.After(quietWindow):
+		}
+	}
+	requireEnqueued := func(queueName string, want int) {
+		t.Helper()
+		enqueued, err := ListWorkflows(dbosCtx, WithFilterQueueName(queueName), WithFilterStatus(WorkflowStatusEnqueued))
+		require.NoError(t, err)
+		require.Len(t, enqueued, want, "queue %s", queueName)
+	}
+
+	for _, batch := range []string{"0", "1"} {
+		exemptGroup, normalGroup := "exempt-"+batch, "normal-"+batch
+		handles := make([]WorkflowHandle[string], 0, exemptEnqueued+2*normalPerQueue)
+
+		for range exemptEnqueued {
+			handle, err := RunWorkflow(dbosCtx, workflow, exemptGroup, WithQueue(exemptQueue))
+			require.NoError(t, err)
+			handles = append(handles, handle)
+		}
+		requireStarts(exemptGroup, exemptLimit)
+		requireEnqueued(exemptQueue.Name, exemptEnqueued-exemptLimit)
+		require.Equal(t, exemptLimit, admission.queueCount(exemptKey))
+		require.Zero(t, processCurrent(), "exempt roots must not hold process permits")
+
+		for _, queue := range []*workflowQueue{normalA, normalB} {
+			for range normalPerQueue {
+				handle, err := RunWorkflow(dbosCtx, workflow, normalGroup, WithQueue(queue))
+				require.NoError(t, err)
+				handles = append(handles, handle)
+			}
+		}
+		requireStarts(normalGroup, processCap)
+		require.Equal(t, processCap, processCurrent())
+		require.Equal(t, processCap, admission.queueCount(normalAKey)+admission.queueCount(normalBKey))
+		require.Equal(t, exemptLimit, admission.queueCount(exemptKey))
+		requireEnqueued(exemptQueue.Name, exemptEnqueued-exemptLimit)
+
+		close(releases[exemptGroup])
+		close(releases[normalGroup])
+		for _, handle := range handles {
+			mustWorkflowResult(t, handle)
+		}
+		require.Eventually(t, func() bool {
+			return processCurrent() == 0 &&
+				admission.queueCount(exemptKey) == 0 &&
+				admission.queueCount(normalAKey) == 0 &&
+				admission.queueCount(normalBKey) == 0
+		}, 5*time.Second, 10*time.Millisecond, "batch %s left admission permits held", batch)
+		for len(started) > 0 {
+			<-started
+		}
+	}
 }
 
 func TestMaxConcurrentWorkflowsReturnsHandleBeforeCapacity(t *testing.T) {
