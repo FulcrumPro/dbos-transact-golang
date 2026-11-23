@@ -986,8 +986,18 @@ func WithDelay(delay time.Duration) WorkflowOption {
 	}
 }
 
+// checkReservedAttributes refuses user attributes that would forge or clear the
+// run-once marker.
+func checkReservedAttributes(attributes map[string]any) error {
+	if _, ok := attributes[models.RunOnceAttributeKey]; ok {
+		return models.NewInvalidOptionError(fmt.Sprintf("workflow attribute %q is reserved by DBOS", models.RunOnceAttributeKey))
+	}
+	return nil
+}
+
 // WithRunOnceMarker marks an enqueued workflow as run-once: its body starts at
-// most once (see WithRunOnce). Must be used together with WithQueue.
+// most once (see WithRunOnce). Must be used together with WithQueue. The marker
+// is stored as the reserved workflow attribute "dbos.run_once".
 func WithRunOnceMarker() WorkflowOption {
 	return func(p *workflowOptions) {
 		p.runOnceMarker = true
@@ -1253,6 +1263,10 @@ func (c *dbosContext) RunWorkflow(_ Context, fn WorkflowFunc, input any, opts ..
 	if params.Priority > 0 && params.queue == nil {
 		c.logger.Error("priority provided but queue name is missing", "workflow_name", params.WorkflowName)
 		return nil, models.NewInvalidOptionError("priority provided but queue name is missing")
+	}
+
+	if err := checkReservedAttributes(params.WorkflowAttributes); err != nil {
+		return nil, err
 	}
 
 	// Run-once workflows start only from their queue
@@ -2066,6 +2080,10 @@ func (c *dbosContext) Enqueue(_ Client, queueName, workflowName string, input an
 
 	if len(workflowName) == 0 {
 		return nil, models.NewInvalidOptionError("workflow name is required")
+	}
+
+	if err := checkReservedAttributes(params.attributes); err != nil {
+		return nil, err
 	}
 
 	// Validate partition key and deduplication ID are not both provided (they are incompatible)
@@ -4623,6 +4641,9 @@ func CancelWorkflow(ctx Client, workflowID string, opts ...CancelWorkflowOption)
 }
 
 func (c *dbosContext) SetWorkflowAttributes(_ Client, workflowID string, attributes map[string]any) error {
+	if err := checkReservedAttributes(attributes); err != nil {
+		return err
+	}
 	workflowState, ok := c.Value(workflowStateKey).(*workflowState)
 	isWithinWorkflow := ok && workflowState != nil
 
@@ -4646,7 +4667,8 @@ func (c *dbosContext) SetWorkflowAttributes(_ Client, workflowID string, attribu
 
 // SetWorkflowAttributes replaces the custom attributes attached to an existing
 // workflow, identified by workflowID. Pass a nil attributes map to clear all
-// attributes. Attributes must be JSON-serializable.
+// attributes. Attributes must be JSON-serializable. The reserved run-once
+// marker attribute is kept and may not be set (see WithRunOnce).
 //
 // Returns an error if the workflow does not exist or the update fails.
 //

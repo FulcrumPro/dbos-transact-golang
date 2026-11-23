@@ -113,7 +113,8 @@ func runOncePops(t *testing.T, ctx Client, workflowID string) int {
 type runOnceRow struct {
 	Status      WorkflowStatusType
 	Attempts    int
-	RunOnce     bool
+	RunOnce     bool // read from the stored attributes, the marker's only home
+	Attributes  map[string]any
 	QueueName   *string
 	CompletedAt *int64
 	UpdatedAt   int64
@@ -124,11 +125,16 @@ func readRunOnceRow(t *testing.T, ctx Client, workflowID string) runOnceRow {
 	t.Helper()
 	s := runOnceSysDB(ctx)
 	var r runOnceRow
+	var attributes *string
 	err := s.Pool().QueryRow(context.Background(), s.RenderSQL(
-		`SELECT status, recovery_attempts, run_once, queue_name, completed_at, updated_at, error FROM %sworkflow_status WHERE workflow_uuid = $1`,
+		`SELECT status, recovery_attempts, attributes, queue_name, completed_at, updated_at, error FROM %sworkflow_status WHERE workflow_uuid = $1`,
 		s.Dialect().SchemaPrefix(s.Schema())), workflowID).
-		Scan(&r.Status, &r.Attempts, &r.RunOnce, &r.QueueName, &r.CompletedAt, &r.UpdatedAt, &r.Error)
+		Scan(&r.Status, &r.Attempts, &attributes, &r.QueueName, &r.CompletedAt, &r.UpdatedAt, &r.Error)
 	require.NoError(t, err, "reading workflow %s", workflowID)
+	if attributes != nil {
+		require.NoError(t, json.Unmarshal([]byte(*attributes), &r.Attributes))
+		r.RunOnce = r.Attributes["dbos.run_once"] == true
+	}
 	return r
 }
 
@@ -859,6 +865,67 @@ func TestRunOnceResumeAndForkRefused(t *testing.T) {
 		require.ErrorIs(t, err, ErrRunOnceWorkflow)
 		_, err = ForkWorkflow[string](ctx, ForkWorkflowInput{OriginalWorkflowID: id})
 		require.ErrorIs(t, err, ErrRunOnceWorkflow)
+	})
+}
+
+// TestRunOnceReservedAttribute: the run-once marker is the reserved attribute
+// "dbos.run_once". It is merged into user attributes at insert, callers cannot
+// set or clear it through any attributes API, and it survives a replacement.
+func TestRunOnceReservedAttribute(t *testing.T) {
+	ctx := setupDBOS(t, setupDBOSOptions{dropDB: true})
+	probe := newRunOnceProbe()
+	RegisterWorkflow(ctx, probe.runOnceBody, WithWorkflowName(runOnceWorkflowName), WithRunOnce())
+	RegisterWorkflow(ctx, probe.ordinaryBody, WithWorkflowName(ordinaryWorkflowName))
+	require.NoError(t, Launch(ctx))
+	ensureRunOnceCounterTable(t, ctx)
+	q := registerRunOnceQueue(t, ctx)
+
+	t.Run("ForgedOrClearedMarkerRefused", func(t *testing.T) {
+		before := countWorkflowRows(t, ctx)
+		for _, value := range []any{true, false} {
+			forged := map[string]any{"dbos.run_once": value}
+			_, err := RunWorkflow(ctx, probe.ordinaryBody, "", WithQueue(q), WithWorkflowAttributes(forged))
+			require.ErrorIs(t, err, ErrInvalidOption)
+			_, err = RunWorkflow(ctx, probe.runOnceBody, "", WithQueue(q), WithRunOnceMarker(), WithWorkflowAttributes(forged))
+			require.ErrorIs(t, err, ErrInvalidOption)
+			_, err = Enqueue[string](ctx, runOnceQueueName, ordinaryWorkflowName, "", WithEnqueueAttributes(forged))
+			require.ErrorIs(t, err, ErrInvalidOption)
+		}
+		assert.Equal(t, before, countWorkflowRows(t, ctx), "a refused start writes no row")
+	})
+
+	t.Run("MarkerMergedAndKept", func(t *testing.T) {
+		id := "run-once-attrs-" + uuid.NewString()
+		_, err := RunWorkflow(ctx, probe.runOnceBody, "", WithQueue(q), WithRunOnceMarker(), WithWorkflowID(id),
+			WithWorkflowAttributes(map[string]any{"customer": "acme"}))
+		require.NoError(t, err)
+		waitForPops(t, ctx, id, 1)
+		row := readRunOnceRow(t, ctx, id)
+		assert.Equal(t, map[string]any{"customer": "acme", "dbos.run_once": true}, row.Attributes)
+
+		require.ErrorIs(t, SetWorkflowAttributes(ctx, id, map[string]any{"dbos.run_once": false}), ErrInvalidOption)
+		require.NoError(t, SetWorkflowAttributes(ctx, id, map[string]any{"customer": "globex"}))
+		assert.Equal(t, map[string]any{"customer": "globex", "dbos.run_once": true}, readRunOnceRow(t, ctx, id).Attributes)
+		require.NoError(t, SetWorkflowAttributes(ctx, id, nil))
+		assert.Equal(t, map[string]any{"dbos.run_once": true}, readRunOnceRow(t, ctx, id).Attributes)
+		_, err = ResumeWorkflow[string](ctx, id)
+		require.ErrorIs(t, err, ErrRunOnceWorkflow, "clearing user attributes keeps the workflow run-once")
+
+		require.NoError(t, Send(ctx, id, "done", runOnceTopic))
+		waitForRow(t, ctx, id, func(r runOnceRow) bool { return r.Status == WorkflowStatusSuccess }, "SUCCESS")
+	})
+
+	t.Run("OrdinaryAttributesUntouched", func(t *testing.T) {
+		id := "ordinary-attrs-" + uuid.NewString()
+		_, err := RunWorkflow(ctx, probe.ordinaryBody, "", WithQueue(q), WithWorkflowID(id),
+			WithWorkflowAttributes(map[string]any{"customer": "acme"}))
+		require.NoError(t, err)
+		waitForPops(t, ctx, id, 1)
+		assert.Equal(t, map[string]any{"customer": "acme"}, readRunOnceRow(t, ctx, id).Attributes)
+		require.NoError(t, SetWorkflowAttributes(ctx, id, nil))
+		assert.Nil(t, readRunOnceRow(t, ctx, id).Attributes)
+		require.NoError(t, Send(ctx, id, "done", runOnceTopic))
+		waitForRow(t, ctx, id, func(r runOnceRow) bool { return r.Status == WorkflowStatusSuccess }, "SUCCESS")
 	})
 }
 

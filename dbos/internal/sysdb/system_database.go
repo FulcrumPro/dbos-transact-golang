@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/url"
 	"reflect"
 	"regexp"
@@ -453,9 +454,6 @@ var migration106SQL string
 //go:embed migrations/107_create_application_versions_unclaimed_index.sql
 var migration107SQL string
 
-//go:embed migrations/108_add_run_once.sql
-var migration108SQL string
-
 type MigrationFile struct {
 	Version int64
 	SQL     string
@@ -621,7 +619,6 @@ func BuildMigrations(schema string, isCockroach bool) []MigrationFile {
 		{Version: 105, SQL: migration105SQLProcessed},
 		{Version: 106, SQL: fmt.Sprintf(migration106SQL, sanitizedSchema)},
 		{Version: 107, SQL: fmt.Sprintf(migration107SQL, c, sanitizedSchema), Online: !isCockroach},
-		{Version: 108, SQL: fmt.Sprintf(migration108SQL, sanitizedSchema)},
 	}
 }
 
@@ -1243,7 +1240,7 @@ type InsertWorkflowResult struct {
 	Timeout           time.Duration
 	WorkflowDeadline  time.Time
 	OwnerXID          string
-	RunOnce           bool // the stored row carries the run-once marker
+	RunOnce           bool // the stored row carries the run-once marker attribute
 	// RunOnceRefused reports that this dequeue must not start the body: the row
 	// was moved to CANCELLED (a repeat dequeue of a run-once row) or ERROR (a
 	// run-once registration dequeued a row without the marker).
@@ -1322,9 +1319,15 @@ func (s *SysDB) InsertWorkflowStatus(ctx context.Context, input InsertWorkflowSt
 		className = &input.Status.ClassName
 	}
 
+	attributes := input.Status.Attributes
+	if input.Status.RunOnce {
+		attributes = make(map[string]any, len(input.Status.Attributes)+1)
+		maps.Copy(attributes, input.Status.Attributes)
+		attributes[models.RunOnceAttributeKey] = true
+	}
 	var attributesJSON *string
-	if len(input.Status.Attributes) > 0 {
-		marshaled, err := json.Marshal(input.Status.Attributes)
+	if len(attributes) > 0 {
+		marshaled, err := json.Marshal(attributes)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal workflow attributes: %w", err)
 		}
@@ -1378,26 +1381,26 @@ func (s *SysDB) InsertWorkflowStatus(ctx context.Context, input InsertWorkflowSt
         schedule_name,
         debounce_deadline_epoch_ms,
         is_debounced,
-        application_name,
-        run_once
-    ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
+        application_name
+    ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
     ON CONFLICT (workflow_uuid)
         DO UPDATE SET
 			recovery_attempts = CASE
-                WHEN EXCLUDED.status NOT IN ($32, $33) THEN workflow_status.recovery_attempts + $34
+                WHEN EXCLUDED.status NOT IN ($31, $32) THEN workflow_status.recovery_attempts + $33
                 ELSE workflow_status.recovery_attempts
             END,
             updated_at = EXCLUDED.updated_at,
             executor_id = CASE
-                WHEN EXCLUDED.status IN ($32, $33) THEN workflow_status.executor_id
+                WHEN EXCLUDED.status IN ($31, $32) THEN workflow_status.executor_id
                 ELSE EXCLUDED.executor_id
             END
-        RETURNING recovery_attempts, status, name, queue_name, queue_partition_key, workflow_timeout_ms, workflow_deadline_epoch_ms, owner_xid, run_once`, s.dialect.SchemaPrefix(s.schema))
+        RETURNING recovery_attempts, status, name, queue_name, queue_partition_key, workflow_timeout_ms, workflow_deadline_epoch_ms, owner_xid, attributes`, s.dialect.SchemaPrefix(s.schema))
 
 	var result InsertWorkflowResult
 	var timeoutMSResult *int64
 	var workflowDeadlineEpochMS *int64
 	var ownerXIDReturn *string
+	var storedAttributes *string
 
 	// Marshal authenticated roles (slice of strings) to JSON for TEXT column
 	authenticatedRoles, err := json.Marshal(input.Status.AuthenticatedRoles)
@@ -1447,7 +1450,6 @@ func (s *SysDB) InsertWorkflowStatus(ctx context.Context, input InsertWorkflowSt
 		debounceDeadlineEpochMs,
 		input.Status.IsDebounced,
 		owner,
-		input.Status.RunOnce,
 		models.WorkflowStatusEnqueued,
 		models.WorkflowStatusDelayed,
 		recoveryIncrement,
@@ -1460,7 +1462,7 @@ func (s *SysDB) InsertWorkflowStatus(ctx context.Context, input InsertWorkflowSt
 		&timeoutMSResult,
 		&workflowDeadlineEpochMS,
 		&ownerXIDReturn,
-		&result.RunOnce,
+		&storedAttributes,
 	)
 	if ownerXIDReturn != nil {
 		result.OwnerXID = *ownerXIDReturn
@@ -1487,6 +1489,16 @@ func (s *SysDB) InsertWorkflowStatus(ctx context.Context, input InsertWorkflowSt
 	// Convert deadline milliseconds to time.Time
 	if workflowDeadlineEpochMS != nil {
 		result.WorkflowDeadline = time.Unix(0, *workflowDeadlineEpochMS*int64(time.Millisecond))
+	}
+
+	// The conflict path never rewrites attributes, so these are the attributes
+	// the workflow was first inserted with.
+	if storedAttributes != nil && *storedAttributes != "" {
+		var stored map[string]any
+		if err := json.Unmarshal([]byte(*storedAttributes), &stored); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal attributes of workflow %s: %w", input.Status.ID, err)
+		}
+		result.RunOnce = models.RunOnceMarked(stored)
 	}
 
 	if len(input.Status.Name) > 0 && result.Name != input.Status.Name {
@@ -1613,7 +1625,7 @@ func (s *SysDB) ListWorkflows(ctx context.Context, input ListWorkflowsDBInput) (
 		"recovery_attempts", "queue_name", "workflow_timeout_ms", "workflow_deadline_epoch_ms", "started_at_epoch_ms",
 		"deduplication_id", "priority", "queue_partition_key", "forked_from", "parent_workflow_id",
 		"serialization", "delay_until_epoch_ms", "was_forked_from", "completed_at", "class_name", "config_name",
-		"attributes", "schedule_name", "debounce_deadline_epoch_ms", "is_debounced", "application_name", "run_once",
+		"attributes", "schedule_name", "debounce_deadline_epoch_ms", "is_debounced", "application_name",
 	}
 
 	if input.LoadOutput {
@@ -1799,7 +1811,7 @@ func (s *SysDB) ListWorkflows(ctx context.Context, input ListWorkflowsDBInput) (
 			&wf.Attempts, &queueName, &timeoutMs,
 			&deadlineMs, &startedAtMs, &deduplicationID, &wf.Priority, &queuePartitionKey, &forkedFrom, &parentWorkflowID,
 			&serialization, &delayUntilEpochMs, &wf.WasForkedFrom, &completedAtMs, &className, &wf.ConfigName,
-			&attributesJSON, &scheduleName, &debounceDeadlineEpochMs, &wf.IsDebounced, &applicationName, &wf.RunOnce,
+			&attributesJSON, &scheduleName, &debounceDeadlineEpochMs, &wf.IsDebounced, &applicationName,
 		}
 
 		if input.LoadOutput {
@@ -1872,6 +1884,7 @@ func (s *SysDB) ListWorkflows(ctx context.Context, input ListWorkflowsDBInput) (
 			if err := json.Unmarshal([]byte(*attributesJSON), &wf.Attributes); err != nil {
 				return nil, fmt.Errorf("failed to unmarshal attributes: %w", err)
 			}
+			wf.RunOnce = models.RunOnceMarked(wf.Attributes)
 		}
 
 		if scheduleName != nil && len(*scheduleName) > 0 {
@@ -1985,12 +1998,33 @@ type SetWorkflowAttributesDBInput struct {
 }
 
 // SetWorkflowAttributes replaces the custom attributes attached to an existing
-// workflow. A nil/empty attributes map clears them (stored as NULL). Returns a
-// non-existent workflow error if no workflow with the given ID exists.
+// workflow. A nil/empty attributes map clears them (stored as NULL), except the
+// run-once marker, which is kept. Returns a non-existent workflow error if no
+// workflow with the given ID exists.
 func (s *SysDB) SetWorkflowAttributes(ctx context.Context, input SetWorkflowAttributesDBInput) error {
+	var runner Querier = s.pool
+	if input.Tx != nil {
+		runner = input.Tx
+	}
+	// The run-once marker outlives any replacement: it is fixed at insert.
+	var marked bool
+	markedQuery := s.RenderSQL(`SELECT %s FROM %sworkflow_status WHERE workflow_uuid = $1`, s.runOnceMarkedSQL(), s.dialect.SchemaPrefix(s.schema))
+	switch err := runner.QueryRow(ctx, markedQuery, input.WorkflowID).Scan(&marked); {
+	case errors.Is(err, ErrNoRows):
+		return models.NewNonExistentWorkflowError(input.WorkflowID)
+	case err != nil:
+		return fmt.Errorf("failed to read workflow attributes: %w", err)
+	}
+	attributes := input.Attributes
+	if marked {
+		attributes = make(map[string]any, len(input.Attributes)+1)
+		maps.Copy(attributes, input.Attributes)
+		attributes[models.RunOnceAttributeKey] = true
+	}
+
 	var attributesJSON *string
-	if len(input.Attributes) > 0 {
-		marshaled, err := json.Marshal(input.Attributes)
+	if len(attributes) > 0 {
+		marshaled, err := json.Marshal(attributes)
 		if err != nil {
 			return fmt.Errorf("failed to marshal workflow attributes: %w", err)
 		}
@@ -2467,7 +2501,7 @@ func (s *SysDB) ResumeWorkflows(ctx context.Context, input ResumeWorkflowsDBInpu
 			runner = tx
 		}
 
-		runOnceQuery := s.RenderSQL(`SELECT workflow_uuid FROM %sworkflow_status WHERE %s AND run_once LIMIT 1`, schemaPrefix, selectAnyClause)
+		runOnceQuery := s.RenderSQL(`SELECT workflow_uuid FROM %sworkflow_status WHERE %s AND %s LIMIT 1`, schemaPrefix, selectAnyClause, s.runOnceMarkedSQL())
 		var runOnceID string
 		switch err := runner.QueryRow(ctx, runOnceQuery, args[4]).Scan(&runOnceID); {
 		case err == nil:
@@ -2511,7 +2545,7 @@ func (s *SysDB) ResumeWorkflows(ctx context.Context, input ResumeWorkflowsDBInpu
 	// The update and the run-once check share one statement snapshot, so a
 	// batch naming a run-once workflow writes nothing.
 	query := s.RenderSQL(`WITH existing AS (
-			SELECT workflow_uuid, run_once FROM %sworkflow_status WHERE %s
+			SELECT workflow_uuid, %s AS run_once FROM %sworkflow_status WHERE %s
 		), updated AS (
 			UPDATE %sworkflow_status
 			SET status = $1, queue_name = $2, recovery_attempts = $3,
@@ -2521,7 +2555,7 @@ func (s *SysDB) ResumeWorkflows(ctx context.Context, input ResumeWorkflowsDBInpu
 			  AND NOT EXISTS (SELECT 1 FROM existing WHERE run_once)
 			RETURNING workflow_uuid
 		)
-		SELECT workflow_uuid, run_once FROM existing`, schemaPrefix, anyClause, schemaPrefix, anyClause)
+		SELECT workflow_uuid, run_once FROM existing`, s.runOnceMarkedSQL(), schemaPrefix, anyClause, schemaPrefix, anyClause)
 
 	var rows Rows
 	if input.Tx != nil {
@@ -2554,6 +2588,15 @@ func (s *SysDB) ResumeWorkflows(ctx context.Context, input ResumeWorkflowsDBInpu
 		return nil, newRunOnceResumeError(runOnceID, len(input.WorkflowIDs))
 	}
 	return found, nil
+}
+
+// runOnceMarkedSQL is a non-NULL boolean SQL expression telling whether the
+// row's attributes carry the run-once marker.
+func (s *SysDB) runOnceMarkedSQL() string {
+	if s.dialect.SupportsAttributesContainment() {
+		return `COALESCE(attributes @> '{"` + models.RunOnceAttributeKey + `": true}'::jsonb, FALSE)`
+	}
+	return `COALESCE(json_extract(attributes, '$."` + models.RunOnceAttributeKey + `"'), 0) = 1`
 }
 
 func newRunOnceResumeError(workflowID string, batchSize int) error {
@@ -2630,7 +2673,7 @@ func (s *SysDB) ForkWorkflows(ctx context.Context, input ForkWorkflowsDBInput) (
 		if !ok {
 			return nil, models.NewNonExistentWorkflowError(id)
 		}
-		// run_once is fixed at insert, so this read in the write's tx cannot go stale.
+		// The marker is fixed at insert, so this read in the write's tx cannot go stale.
 		if wf.RunOnce {
 			reason := "it cannot be forked"
 			if len(input.OriginalWorkflowIDs) > 1 {
@@ -6995,7 +7038,7 @@ func (s *SysDB) ExportWorkflow(ctx context.Context, workflowID string, exportChi
 				workflow_deadline_epoch_ms, started_at_epoch_ms, deduplication_id, inputs, priority,
 				queue_partition_key, forked_from, parent_workflow_id, delay_until_epoch_ms, serialization,
 				was_forked_from, rate_limited, completed_at, attributes, schedule_name,
-				debounce_deadline_epoch_ms, is_debounced, application_name, run_once
+				debounce_deadline_epoch_ms, is_debounced, application_name
 			FROM %sworkflow_status WHERE workflow_uuid = $1`, s.dialect.SchemaPrefix(s.schema))
 
 		row := tx.QueryRow(ctx, statusQuery, wfID)
@@ -7010,7 +7053,7 @@ func (s *SysDB) ExportWorkflow(ctx context.Context, workflowID string, exportChi
 			priority                                                     *int
 			delayUntilEpochMs                                            *int64
 			serialization                                                *string
-			wasForkedFrom, rateLimited, isDebounced, runOnce             *bool
+			wasForkedFrom, rateLimited, isDebounced                      *bool
 			completedAt, debounceDeadlineEpochMs                         *int64
 			attributes, wfScheduleName, applicationName                  *string
 		)
@@ -7021,7 +7064,7 @@ func (s *SysDB) ExportWorkflow(ctx context.Context, workflowID string, exportChi
 			&workflowDeadlineEpochMs, &startedAtEpochMs, &dedupID, &inputs, &priority,
 			&queuePartitionKey, &forkedFrom, &parentWorkflowID, &delayUntilEpochMs, &serialization,
 			&wasForkedFrom, &rateLimited, &completedAt, &attributes, &wfScheduleName,
-			&debounceDeadlineEpochMs, &isDebounced, &applicationName, &runOnce,
+			&debounceDeadlineEpochMs, &isDebounced, &applicationName,
 		)
 		if err != nil {
 			if err == pgx.ErrNoRows {
@@ -7067,7 +7110,6 @@ func (s *SysDB) ExportWorkflow(ctx context.Context, workflowID string, exportChi
 			"debounce_deadline_epoch_ms": debounceDeadlineEpochMs,
 			"is_debounced":               isDebounced,
 			"application_name":           applicationName,
-			"run_once":                   runOnce,
 		}
 
 		// Export operation_outputs
@@ -7247,11 +7289,11 @@ func (s *SysDB) ImportWorkflow(ctx context.Context, workflows []ExportedWorkflow
 				workflow_deadline_epoch_ms, started_at_epoch_ms, deduplication_id, inputs, priority,
 				queue_partition_key, forked_from, parent_workflow_id, delay_until_epoch_ms, serialization,
 				was_forked_from, rate_limited, completed_at, attributes, schedule_name,
-				debounce_deadline_epoch_ms, is_debounced, application_name, run_once
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37)`,
+				debounce_deadline_epoch_ms, is_debounced, application_name
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36)`,
 			s.dialect.SchemaPrefix(s.schema))
 
-		// was_forked_from, rate_limited, is_debounced and run_once are NOT NULL; default them to false
+		// was_forked_from and rate_limited are NOT NULL; default them to false
 		// for payloads exported before these fields were included (older exports,
 		// or ones from an SDK that omits them), so importing them doesn't violate
 		// the constraint.
@@ -7269,7 +7311,6 @@ func (s *SysDB) ImportWorkflow(ctx context.Context, workflows []ExportedWorkflow
 		wasForkedFrom := boolOrFalse(status["was_forked_from"])
 		rateLimited := boolOrFalse(status["rate_limited"])
 		isDebounced := boolOrFalse(status["is_debounced"])
-		runOnce := boolOrFalse(status["run_once"])
 
 		_, err := tx.Exec(ctx, insertStatusQuery,
 			status["workflow_uuid"], status["status"], status["name"],
@@ -7282,7 +7323,7 @@ func (s *SysDB) ImportWorkflow(ctx context.Context, workflows []ExportedWorkflow
 			status["queue_partition_key"], status["forked_from"], status["parent_workflow_id"],
 			status["delay_until_epoch_ms"], status["serialization"], wasForkedFrom,
 			rateLimited, status["completed_at"], status["attributes"], status["schedule_name"],
-			status["debounce_deadline_epoch_ms"], isDebounced, status["application_name"], runOnce,
+			status["debounce_deadline_epoch_ms"], isDebounced, status["application_name"],
 		)
 		if err != nil {
 			return fmt.Errorf("failed to import workflow_status: %w", err)

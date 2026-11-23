@@ -1,1 +1,0 @@
-ALTER TABLE "workflow_status" ADD COLUMN "run_once" BOOLEAN NOT NULL DEFAULT FALSE;
