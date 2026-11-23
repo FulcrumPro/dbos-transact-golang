@@ -260,6 +260,17 @@ func freshRunOnceDB(t *testing.T) string {
 	return dbURL
 }
 
+// stopExecutor stops a runtime mid-body, then sends the ordinary control its
+// message while no runtime is up, so the recovered control finds it pending
+// (a runtime that just launched may not be listening for notifications yet).
+func stopExecutor(t *testing.T, a Context, dbURL, ordinaryID string) Client {
+	t.Helper()
+	require.NoError(t, Shutdown(a, 30*time.Second))
+	obs := runOnceObserver(t, dbURL)
+	require.NoError(t, Send(obs, ordinaryID, "done", runOnceTopic))
+	return obs
+}
+
 // assertDeadRecovery checks the outcome of recovering a dead executor's two
 // PENDING workflows: the run-once body is not started again and the row is
 // CANCELLED; the ordinary control is re-run and completes.
@@ -271,7 +282,6 @@ func assertDeadRecovery(t *testing.T, survivor Context, runOnceID, ordinaryID st
 	assert.NotNil(t, row.CompletedAt, "a refused run-once row is completed like a cancellation")
 
 	waitForPops(t, survivor, ordinaryID, 2)
-	require.NoError(t, Send(survivor, ordinaryID, "done", runOnceTopic))
 	waitForRow(t, survivor, ordinaryID, func(r runOnceRow) bool { return r.Status == WorkflowStatusSuccess }, "SUCCESS")
 
 	assert.Equal(t, 1, runOncePops(t, survivor, runOnceID), "the run-once body must start exactly once")
@@ -372,8 +382,7 @@ func TestRunOnceRecovery(t *testing.T) {
 		q := registerRunOnceQueue(t, a)
 		runOnceID, ordinaryID := startRunOncePair(t, a, q, probe)
 
-		require.NoError(t, Shutdown(a, 30*time.Second))
-		obs := runOnceObserver(t, cfg.dbURL)
+		obs := stopExecutor(t, a, cfg.dbURL, ordinaryID)
 		require.Equal(t, WorkflowStatusPending, readRunOnceRow(t, obs, runOnceID).Status, "an executor stopping mid-body leaves the row PENDING")
 		require.Equal(t, WorkflowStatusPending, readRunOnceRow(t, obs, ordinaryID).Status)
 
@@ -388,7 +397,7 @@ func TestRunOnceRecovery(t *testing.T) {
 			a := newRunOnceRuntime(t, cfg, probe)
 			q := registerRunOnceQueue(t, a)
 			runOnceID, ordinaryID := startRunOncePair(t, a, q, probe)
-			require.NoError(t, Shutdown(a, 30*time.Second))
+			stopExecutor(t, a, cfg.dbURL, ordinaryID)
 
 			cfg.executorID = "exec-b"
 			cfg.adminPort = freeTCPPort(t)
@@ -417,7 +426,7 @@ func TestRunOnceRecovery(t *testing.T) {
 			a := newRunOnceRuntime(t, cfg, probe)
 			q := registerRunOnceQueue(t, a)
 			runOnceID, ordinaryID := startRunOncePair(t, a, q, probe)
-			require.NoError(t, Shutdown(a, 30*time.Second))
+			stopExecutor(t, a, cfg.dbURL, ordinaryID)
 
 			cfg.executorID = "exec-b"
 			b := newRunOnceRuntime(t, cfg, probe)
