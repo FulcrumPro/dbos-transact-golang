@@ -176,6 +176,7 @@ type runOnceRuntimeConfig struct {
 	adminPort  int
 	maxRoots   int
 	logger     *slog.Logger
+	wrapPool   func(sysdb.Pool) sysdb.Pool // installed before Launch
 }
 
 // newRunOnceRuntime launches a runtime with the run-once harness and its
@@ -197,6 +198,10 @@ func newRunOnceRuntime(t *testing.T, cfg runOnceRuntimeConfig, probe *runOncePro
 	require.NoError(t, err)
 	RegisterWorkflow(c, probe.runOnceBody, WithWorkflowName(runOnceWorkflowName), WithRunOnce())
 	RegisterWorkflow(c, probe.ordinaryBody, WithWorkflowName(ordinaryWorkflowName))
+	if cfg.wrapPool != nil {
+		s := runOnceSysDB(c)
+		s.SetPool(cfg.wrapPool(s.Pool()))
+	}
 	require.NoError(t, Launch(c))
 	t.Cleanup(func() { Shutdown(c, 30*time.Second) })
 	ensureRunOnceCounterTable(t, c)
@@ -1029,6 +1034,194 @@ func TestRunOnceRecoveryWithSaturatedPermits(t *testing.T) {
 			waitForRow(t, a, waitingID, func(r runOnceRow) bool { return r.Status == WorkflowStatusSuccess }, "SUCCESS")
 		})
 	}
+}
+
+// stallPool holds the first matching transaction, either before its matching
+// statement or at its commit, until the test releases it.
+type stallPool struct {
+	sysdb.Pool
+	mu       sync.Mutex
+	match    func(string, []any) bool
+	atCommit bool
+	reached  chan struct{}
+	release  chan struct{}
+}
+
+func (p *stallPool) arm(match func(string, []any) bool, atCommit bool) (reached <-chan struct{}, release func()) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.match, p.atCommit = match, atCommit
+	p.reached, p.release = make(chan struct{}), make(chan struct{})
+	rel := p.release
+	return p.reached, func() { close(rel) }
+}
+
+func (p *stallPool) BeginTx(ctx context.Context, opts TxOptions) (Tx, error) {
+	tx, err := p.Pool.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &stallTx{Tx: tx, p: p}, nil
+}
+
+// claim reports whether this statement is the armed one, and whether to stall
+// before running it. The pool disarms itself on the first match.
+func (p *stallPool) claim(q string, args []any) (matched, stallNow bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.match == nil || !p.match(q, args) {
+		return false, false
+	}
+	p.match = nil
+	return true, !p.atCommit
+}
+
+func (p *stallPool) stall() {
+	p.mu.Lock()
+	reached, release := p.reached, p.release
+	p.mu.Unlock()
+	close(reached)
+	<-release
+}
+
+type stallTx struct {
+	sysdb.Tx
+	p       *stallPool
+	stallAt bool // stall at this transaction's commit
+}
+
+func (t *stallTx) before(q string, args []any) {
+	matched, stallNow := t.p.claim(q, args)
+	if stallNow {
+		t.p.stall()
+	} else if matched {
+		t.stallAt = true
+	}
+}
+
+func (t *stallTx) Exec(ctx context.Context, q string, args ...any) (sysdb.Result, error) {
+	t.before(q, args)
+	return t.Tx.Exec(ctx, q, args...)
+}
+
+func (t *stallTx) Query(ctx context.Context, q string, args ...any) (sysdb.Rows, error) {
+	t.before(q, args)
+	return t.Tx.Query(ctx, q, args...)
+}
+
+func (t *stallTx) QueryRow(ctx context.Context, q string, args ...any) sysdb.Row {
+	t.before(q, args)
+	return t.Tx.QueryRow(ctx, q, args...)
+}
+
+func (t *stallTx) Commit(ctx context.Context) error {
+	if t.stallAt {
+		t.stallAt = false
+		t.p.stall()
+	}
+	return t.Tx.Commit(ctx)
+}
+
+func awaitSignal(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(20 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+// TestRunOnceRecoveryRacesDispatch interleaves recovery with the dispatch that
+// records a run-once workflow's first start, on a queue with one permit that
+// the dispatch holds. Either order must end CANCELLED with the body started at
+// most once, and leave nothing waiting behind the dispatch's own permit.
+func TestRunOnceRecoveryRacesDispatch(t *testing.T) {
+	setup := func(t *testing.T) (Context, Queue, *runOnceProbe, *stallPool) {
+		probe := newRunOnceProbe()
+		pool := &stallPool{}
+		cfg := runOnceRuntimeConfig{dbURL: freshRunOnceDB(t), appVersion: "run-once-" + uuid.NewString(), executorID: "exec-a",
+			wrapPool: func(inner sysdb.Pool) sysdb.Pool { pool.Pool = inner; return pool }}
+		a := newRunOnceRuntime(t, cfg, probe)
+		return a, registerRunOnceQueue(t, a, WithWorkerConcurrency(1)), probe, pool
+	}
+	// The queue's single permit is free again: a later run-once workflow runs.
+	assertPermitFree := func(t *testing.T, a Context, q Queue, probe *runOnceProbe) {
+		next := "run-once-next-" + uuid.NewString()
+		_, err := RunWorkflow(a, probe.runOnceBody, "", WithQueue(q), WithWorkflowID(next))
+		require.NoError(t, err)
+		waitForPops(t, a, next, 1)
+		require.NoError(t, Send(a, next, "done", runOnceTopic))
+		waitForRow(t, a, next, func(r runOnceRow) bool { return r.Status == WorkflowStatusSuccess }, "SUCCESS")
+	}
+
+	// Recovery re-enqueues the row (recovery_attempts still 0) before the
+	// dispatch records the start: the dispatch must not start the body.
+	t.Run("RecoveryFirst", func(t *testing.T) {
+		a, q, probe, pool := setup(t)
+		id := "run-once-race-" + uuid.NewString()
+		reached, release := pool.arm(isDequeueStatusInsertFor(id), false)
+		_, err := RunWorkflow(a, probe.runOnceBody, "", WithQueue(q), WithWorkflowID(id))
+		require.NoError(t, err)
+		awaitSignal(t, reached, "the dispatch's status insert")
+
+		row := readRunOnceRow(t, a, id)
+		require.Equal(t, WorkflowStatusPending, row.Status)
+		require.Equal(t, 0, row.Attempts)
+		recovered, err := recoverPendingWorkflows(a.(*dbosContext), []string{"exec-a"})
+		require.NoError(t, err)
+		require.Len(t, recovered, 1)
+		require.Equal(t, WorkflowStatusEnqueued, readRunOnceRow(t, a, id).Status, "an unstarted row is re-enqueued")
+
+		release()
+		row = waitForRow(t, a, id, isCancelledRow, "CANCELLED")
+		assert.Equal(t, 1, row.Attempts)
+		assert.Equal(t, 0, runOncePops(t, a, id), "a dispatch whose claim was revoked must not start the body")
+		assertPermitFree(t, a, q, probe)
+		assert.Equal(t, 0, runOncePops(t, a, id))
+	})
+
+	// The dispatch holds the row, with its first start recorded but not yet
+	// committed, while recovery runs: recovery must wait and then cancel it.
+	t.Run("DispatchFirst", func(t *testing.T) {
+		skipIfSqlite(t, "needs two concurrent writers")
+		skipIfCockroach(t, "reads lock waits from pg_stat_activity")
+		a, q, probe, pool := setup(t)
+		id := "run-once-race-" + uuid.NewString()
+		reached, release := pool.arm(isDequeueStatusInsertFor(id), true)
+		_, err := RunWorkflow(a, probe.runOnceBody, "", WithQueue(q), WithWorkflowID(id))
+		require.NoError(t, err)
+		awaitSignal(t, reached, "the dispatch's commit")
+
+		type result struct {
+			handles []WorkflowHandle[any]
+			err     error
+		}
+		done := make(chan result, 1)
+		go func() {
+			h, err := recoverPendingWorkflows(a.(*dbosContext), []string{"exec-a"})
+			done <- result{h, err}
+		}()
+		s := runOnceSysDB(a)
+		require.Eventually(t, func() bool {
+			var waiting int
+			err := s.Pool().QueryRow(context.Background(),
+				`SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%UPDATE%workflow_status%'`).Scan(&waiting)
+			return err == nil && waiting > 0
+		}, 10*time.Second, 10*time.Millisecond, "recovery never waited on the dispatch's row lock")
+		release()
+		res := <-done
+		require.NoError(t, res.err)
+		require.Len(t, res.handles, 1)
+
+		row := waitForRow(t, a, id, isCancelledRow, "CANCELLED")
+		assert.Equal(t, 1, row.Attempts)
+		require.Eventually(t, func() bool { _, ok := probe.recvError(id); return ok },
+			20*time.Second, 20*time.Millisecond, "the started body never returned from Recv")
+		recvErr, _ := probe.recvError(id)
+		assert.ErrorIs(t, recvErr, ErrWorkflowCancelled, "the started body's next DBOS call sees the cancellation")
+		assert.Equal(t, 1, runOncePops(t, a, id))
+		assertPermitFree(t, a, q, probe)
+	})
 }
 
 // TestRunOnceListingSurvivesReplay: a workflow's checkpointed ListWorkflows

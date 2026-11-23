@@ -1503,7 +1503,10 @@ func (s *SysDB) InsertWorkflowStatus(ctx context.Context, input InsertWorkflowSt
 	// first commit landed) cancels it instead, whoever owns it.
 	if input.IncrementAttempts && result.Status != models.WorkflowStatusSuccess && result.Status != models.WorkflowStatusError {
 		switch {
-		case result.RunOnce && result.Attempts > 1:
+		// Attempts > 1: a second start. A status other than PENDING: recovery
+		// re-enqueued the row after this dequeue claimed it, so the claim is
+		// revoked and starting the body could run it twice.
+		case result.RunOnce && (result.Attempts > 1 || result.Status != models.WorkflowStatusPending):
 			if err := s.refuseRunOnce(ctx, input.Tx, input.Status.ID, models.WorkflowStatusCancelled, nil, &result); err != nil {
 				return nil, err
 			}
@@ -1547,14 +1550,14 @@ func (s *SysDB) InsertWorkflowStatus(ctx context.Context, input InsertWorkflowSt
 }
 
 // refuseRunOnce ends a dequeued run-once workflow without starting its body,
-// moving a PENDING row to status (CANCELLED or ERROR, with errStr recorded).
-// The body is refused even when the row is no longer PENDING.
+// moving a PENDING or ENQUEUED row to status (CANCELLED or ERROR, with errStr
+// recorded). The body is refused whatever the row's status.
 func (s *SysDB) refuseRunOnce(ctx context.Context, tx Tx, workflowID string, status models.WorkflowStatusType, errStr *string, result *InsertWorkflowResult) error {
 	query := s.RenderSQL(`UPDATE %sworkflow_status
 			SET status = $1, error = COALESCE($2, error), updated_at = $3, completed_at = $3,
 			    started_at_epoch_ms = NULL, queue_name = NULL, deduplication_id = NULL
-			WHERE workflow_uuid = $4 AND status = $5`, s.dialect.SchemaPrefix(s.schema))
-	res, err := tx.Exec(ctx, query, status, errStr, time.Now().UnixMilli(), workflowID, models.WorkflowStatusPending)
+			WHERE workflow_uuid = $4 AND status IN ($5, $6)`, s.dialect.SchemaPrefix(s.schema))
+	res, err := tx.Exec(ctx, query, status, errStr, time.Now().UnixMilli(), workflowID, models.WorkflowStatusPending, models.WorkflowStatusEnqueued)
 	if err != nil {
 		return fmt.Errorf("failed to refuse run-once workflow %s: %w", workflowID, err)
 	}
@@ -5215,70 +5218,52 @@ func (s *SysDB) ReenqueueForRecovery(ctx context.Context, executorIDs []string, 
 		appNameClause = " AND " + nameFilterSQL("application_name", len(args))
 	}
 
-	// A run-once workflow whose body already started is cancelled here rather
-	// than re-enqueued: a re-enqueued row would wait for a queue or process
-	// permit that its own live body may hold, and the body would keep running
-	// meanwhile. A row that never started (recovery_attempts = 0) is recovered
-	// normally and its first dequeue starts it.
-	cancelArgs := []any{models.WorkflowStatusCancelled, time.Now().UnixMilli(), models.WorkflowStatusPending, encodedExecutorIDs}
-	cancelFilter := dialectAnyClause(s.dialect, "executor_id", 4)
-	if appVersion != "" {
-		cancelArgs = append(cancelArgs, appVersion)
-		cancelFilter += fmt.Sprintf(" AND application_version = $%d", len(cancelArgs))
-	}
-	if s.appName != "" {
-		cancelArgs = append(cancelArgs, s.appName)
-		cancelFilter += " AND " + nameFilterSQL("application_name", len(cancelArgs))
-	}
-	cancelQuery := s.RenderSQL(`UPDATE %sworkflow_status
-			  SET status = $1, updated_at = $2, completed_at = $2, started_at_epoch_ms = NULL,
-			      queue_name = NULL, deduplication_id = NULL
-			  WHERE status = $3
-			    AND %s
-			    AND recovery_attempts >= 1 AND %s
-			  RETURNING workflow_uuid`, s.dialect.SchemaPrefix(s.schema), cancelFilter, s.runOnceMarkedSQL())
-	cancelledIDs, err := s.collectIDs(ctx, cancelQuery, cancelArgs...)
+	// A run-once workflow whose body already started is cancelled rather than
+	// re-enqueued: a re-enqueued row would wait for a queue or process permit
+	// that its own live body may hold, while that body keeps running. A row that
+	// never started (recovery_attempts = 0) is re-enqueued, and its first
+	// dequeue starts it. One statement classifies each row: a dispatch that
+	// holds the row while it records the first start makes this UPDATE wait and
+	// re-read the row, so it sees recovery_attempts = 1.
+	args = append(args, models.WorkflowStatusCancelled)
+	cancelArg := len(args)
+	cancel := fmt.Sprintf("(%s AND recovery_attempts >= 1)", s.runOnceMarkedSQL())
+	// NULLIF: legacy rows stored not-enqueued as '' rather than NULL
+	query := s.RenderSQL(`UPDATE %sworkflow_status
+			  SET status = CASE WHEN %[2]s THEN $%[3]d ELSE $1 END,
+			      started_at_epoch_ms = NULL, updated_at = $2,
+			      completed_at = CASE WHEN %[2]s THEN $2 ELSE completed_at END,
+			      deduplication_id = CASE WHEN %[2]s THEN NULL ELSE deduplication_id END,
+			      queue_name = CASE WHEN %[2]s THEN NULL ELSE COALESCE(NULLIF(queue_name, ''), $3) END
+			  WHERE status = $4
+			    AND %[4]s%[5]s%[6]s
+			  RETURNING workflow_uuid, status`, s.dialect.SchemaPrefix(s.schema), cancel, cancelArg, executorClause, versionClause, appNameClause)
+
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to cancel run-once workflows for recovery: %w", err)
+		return nil, fmt.Errorf("failed to re-enqueue workflows for recovery: %w", err)
+	}
+	defer rows.Close()
+
+	var workflowIDs, cancelledIDs []string
+	for rows.Next() {
+		var id string
+		var status models.WorkflowStatusType
+		if err := rows.Scan(&id, &status); err != nil {
+			return nil, fmt.Errorf("failed to scan re-enqueued workflow id: %w", err)
+		}
+		workflowIDs = append(workflowIDs, id)
+		if status == models.WorkflowStatusCancelled {
+			cancelledIDs = append(cancelledIDs, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read re-enqueued workflow ids: %w", err)
 	}
 	if len(cancelledIDs) > 0 {
 		s.logger.Warn("Cancelled run-once workflows instead of recovering them", "workflow_ids", cancelledIDs)
 	}
-	// NULLIF: legacy rows stored not-enqueued as '' rather than NULL
-	query := s.RenderSQL(`UPDATE %sworkflow_status
-			  SET status = $1, started_at_epoch_ms = NULL, updated_at = $2,
-			      queue_name = COALESCE(NULLIF(queue_name, ''), $3)
-			  WHERE status = $4
-			    AND %s%s%s
-			  RETURNING workflow_uuid`, s.dialect.SchemaPrefix(s.schema), executorClause, versionClause, appNameClause)
-
-	workflowIDs, err := s.collectIDs(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to re-enqueue workflows for recovery: %w", err)
-	}
-	return append(cancelledIDs, workflowIDs...), nil
-}
-
-// collectIDs runs a query on the pool that returns one workflow ID per row.
-func (s *SysDB) collectIDs(ctx context.Context, query string, args ...any) ([]string, error) {
-	rows, err := s.pool.Query(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("failed to scan workflow id: %w", err)
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to read workflow ids: %w", err)
-	}
-	return ids, nil
+	return workflowIDs, nil
 }
 
 type GetQueuePartitionsInput struct {
