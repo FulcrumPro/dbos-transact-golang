@@ -1036,21 +1036,28 @@ func TestRunOnceRecoveryWithSaturatedPermits(t *testing.T) {
 	}
 }
 
-// stallPool holds the first matching transaction, either before its matching
-// statement or at its commit, until the test releases it.
+type stallPoint int
+
+const (
+	stallBeforeCommit stallPoint = iota // the transaction's writes are made but not committed
+	stallAfterCommit                    // committed, before the caller sees the result
+)
+
+// stallPool holds the first transaction running a matching statement at the
+// chosen point until the test releases it.
 type stallPool struct {
 	sysdb.Pool
-	mu       sync.Mutex
-	match    func(string, []any) bool
-	atCommit bool
-	reached  chan struct{}
-	release  chan struct{}
+	mu      sync.Mutex
+	match   func(string, []any) bool
+	point   stallPoint
+	reached chan struct{}
+	release chan struct{}
 }
 
-func (p *stallPool) arm(match func(string, []any) bool, atCommit bool) (reached <-chan struct{}, release func()) {
+func (p *stallPool) arm(match func(string, []any) bool, point stallPoint) (reached <-chan struct{}, release func()) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.match, p.atCommit = match, atCommit
+	p.match, p.point = match, point
 	p.reached, p.release = make(chan struct{}), make(chan struct{})
 	rel := p.release
 	return p.reached, func() { close(rel) }
@@ -1064,16 +1071,16 @@ func (p *stallPool) BeginTx(ctx context.Context, opts TxOptions) (Tx, error) {
 	return &stallTx{Tx: tx, p: p}, nil
 }
 
-// claim reports whether this statement is the armed one, and whether to stall
-// before running it. The pool disarms itself on the first match.
-func (p *stallPool) claim(q string, args []any) (matched, stallNow bool) {
+// claim reports whether this statement is the armed one. The pool disarms
+// itself on the first match.
+func (p *stallPool) claim(q string, args []any) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.match == nil || !p.match(q, args) {
-		return false, false
+		return false
 	}
 	p.match = nil
-	return true, !p.atCommit
+	return true
 }
 
 func (p *stallPool) stall() {
@@ -1087,14 +1094,11 @@ func (p *stallPool) stall() {
 type stallTx struct {
 	sysdb.Tx
 	p       *stallPool
-	stallAt bool // stall at this transaction's commit
+	stallAt bool // this transaction ran the armed statement
 }
 
 func (t *stallTx) before(q string, args []any) {
-	matched, stallNow := t.p.claim(q, args)
-	if stallNow {
-		t.p.stall()
-	} else if matched {
+	if t.p.claim(q, args) {
 		t.stallAt = true
 	}
 }
@@ -1115,11 +1119,27 @@ func (t *stallTx) QueryRow(ctx context.Context, q string, args ...any) sysdb.Row
 }
 
 func (t *stallTx) Commit(ctx context.Context) error {
-	if t.stallAt {
-		t.stallAt = false
-		t.p.stall()
+	if !t.stallAt {
+		return t.Tx.Commit(ctx)
 	}
-	return t.Tx.Commit(ctx)
+	t.stallAt = false
+	t.p.mu.Lock()
+	point := t.p.point
+	t.p.mu.Unlock()
+	if point == stallBeforeCommit {
+		t.p.stall()
+		return t.Tx.Commit(ctx)
+	}
+	err := t.Tx.Commit(ctx)
+	t.p.stall()
+	return err
+}
+
+// isDequeueClaimOf matches DequeueWorkflows' claim of the workflow (ENQUEUED to PENDING).
+func isDequeueClaimOf(workflowID string) func(string, []any) bool {
+	return func(q string, args []any) bool {
+		return strings.Contains(q, "UPDATE") && strings.Contains(q, "rate_limited = ") && len(args) > 5 && args[5] == workflowID
+	}
 }
 
 func awaitSignal(t *testing.T, ch <-chan struct{}, what string) {
@@ -1154,15 +1174,16 @@ func TestRunOnceRecoveryRacesDispatch(t *testing.T) {
 		waitForRow(t, a, next, func(r runOnceRow) bool { return r.Status == WorkflowStatusSuccess }, "SUCCESS")
 	}
 
-	// Recovery re-enqueues the row (recovery_attempts still 0) before the
-	// dispatch records the start: the dispatch must not start the body.
+	// The dequeue has claimed the row but the dispatch has not recorded the
+	// start yet, so recovery re-enqueues it (recovery_attempts still 0): the
+	// dispatch must then not start the body.
 	t.Run("RecoveryFirst", func(t *testing.T) {
 		a, q, probe, pool := setup(t)
 		id := "run-once-race-" + uuid.NewString()
-		reached, release := pool.arm(isDequeueStatusInsertFor(id), false)
+		reached, release := pool.arm(isDequeueClaimOf(id), stallAfterCommit)
 		_, err := RunWorkflow(a, probe.runOnceBody, "", WithQueue(q), WithWorkflowID(id))
 		require.NoError(t, err)
-		awaitSignal(t, reached, "the dispatch's status insert")
+		awaitSignal(t, reached, "the dequeue's claim")
 
 		row := readRunOnceRow(t, a, id)
 		require.Equal(t, WorkflowStatusPending, row.Status)
@@ -1187,7 +1208,7 @@ func TestRunOnceRecoveryRacesDispatch(t *testing.T) {
 		skipIfCockroach(t, "reads lock waits from pg_stat_activity")
 		a, q, probe, pool := setup(t)
 		id := "run-once-race-" + uuid.NewString()
-		reached, release := pool.arm(isDequeueStatusInsertFor(id), true)
+		reached, release := pool.arm(isDequeueStatusInsertFor(id), stallBeforeCommit)
 		_, err := RunWorkflow(a, probe.runOnceBody, "", WithQueue(q), WithWorkflowID(id))
 		require.NoError(t, err)
 		awaitSignal(t, reached, "the dispatch's commit")
